@@ -1,0 +1,325 @@
+可以，把这一段接到“饭店模型”里以后，整个数据库访问层会非常顺。
+
+```text
+┌──────────────────────────────────────────────┐
+│              用户发来一个请求               │
+│     例如：查询订单 / 保存对话状态            │
+└──────────────────────────────────────────────┘
+                      │
+                      ▼
+              ┌───────────────┐
+              │ Service 层    │
+              │ = 前厅经理    │
+              └───────────────┘
+                      │
+          “这件事需要查数据库”
+                      │
+                      ▼
+        ┌────────────────────────────┐
+        │ Repository                │
+        │ = 专门跑后厨事务的办事员   │
+        └────────────────────────────┘
+                      │
+          “我要查订单 / 保存状态”
+                      │
+                      ▼
+        ┌────────────────────────────┐
+        │ Session                   │
+        │ = 这一桌专属工作单         │
+        │                            │
+        │ 负责这一轮的：             │
+        │ SELECT / INSERT / UPDATE   │
+        │ commit / rollback          │
+        └────────────────────────────┘
+                      │
+             “真正执行 SQL”
+                      │
+                      ▼
+        ┌────────────────────────────┐
+        │ Engine                    │
+        │ = 后厨运输总系统           │
+        │                            │
+        │ 管理数据库驱动、连接池     │
+        │ 借连接、还连接             │
+        └────────────────────────────┘
+                      │
+                      ▼
+        ┌────────────────────────────┐
+        │ Connection Pool           │
+        │ = 一组可复用传菜通道       │
+        └────────────────────────────┘
+                      │
+                      ▼
+        ┌────────────────────────────┐
+        │ MySQL                     │
+        │ = 真正的后厨 / 仓库 / 账本 │
+        └────────────────────────────┘
+```
+
+最核心的一条链就是：
+
+```text
+Service
+  ↓
+Repository
+  ↓
+Session
+  ↓
+Engine
+  ↓
+MySQL
+```
+
+可以把每一层的角色压成一句话：
+
+```text
+Service
+= 这次业务要干什么
+
+Repository
+= 数据库层应该怎么干
+
+Session
+= 这一轮数据库操作的事务上下文
+
+Engine
+= 怎么连接和调度数据库连接
+
+MySQL
+= 真正保存数据的地方
+```
+
+举个你这个客服项目的例子，会更直观。
+
+假设现在要保存用户对话状态：
+
+```text
+用户刚完成一轮聊天
+        │
+        ▼
+DialogueService
+        │
+        │ “需要保存这个用户状态”
+        ▼
+DialogueStateRepository
+        │
+        │ “我负责数据库存取”
+        ▼
+Session
+        │
+        │ session.add(...)
+        │ await session.commit()
+        ▼
+Engine
+        │
+        │ 从连接池拿连接
+        │ 执行 INSERT / UPDATE
+        ▼
+MySQL
+        │
+        ▼
+dialogue_states 表
+```
+
+代码大概会长这样：
+
+```python
+async def save_state(sender_id, state_json):
+    async with async_session() as session:
+        ...
+        session.add(state)
+        await session.commit()
+```
+
+这几行背后的真实角色链是：
+
+```text
+async_session()
+   ↓
+创建一个 Session
+
+session.add(...)
+   ↓
+告诉这一轮事务：
+“我要新增/修改这个对象”
+
+session.commit()
+   ↓
+通过 Engine
+把 SQL 真正提交到 MySQL
+```
+
+再看查询：
+
+```python
+async with async_session() as session:
+    result = await session.execute(...)
+```
+
+它对应：
+
+```text
+Repository
+说：
+“我要查 sender_id = xxx 的状态”
+
+        ↓
+
+Session
+接到查询任务
+
+        ↓
+
+Engine
+给它安排数据库连接
+
+        ↓
+
+MySQL
+执行 SELECT
+
+        ↓
+
+查询结果一路返回
+
+MySQL
+  ↑
+Engine
+  ↑
+Session
+  ↑
+Repository
+  ↑
+Service
+```
+
+所以它其实有两个方向：
+
+```text
+请求方向：
+
+Service
+  ↓
+Repository
+  ↓
+Session
+  ↓
+Engine
+  ↓
+MySQL
+
+
+结果方向：
+
+MySQL
+  ↑
+Engine
+  ↑
+Session
+  ↑
+Repository
+  ↑
+Service
+```
+
+这个“去”和“回”特别重要。
+
+你也可以把它记成饭店语言：
+
+```text
+Service
+= 前厅经理
+知道客人要干什么
+
+Repository
+= 专门负责去后厨办事的人
+知道该查哪张表、怎么查
+
+Session
+= 这次办事的专属工作单
+负责事务边界
+
+Engine
+= 后厨运输和连接调度系统
+
+MySQL
+= 最终保存事实的仓库
+```
+
+其中最容易混淆的是 `Repository` 和 `Session`。
+
+它俩的区别是：
+
+```text
+Repository
+= 业务层面的“数据库操作封装”
+
+Session
+= 技术层面的“数据库会话/事务工具”
+```
+
+例如 Repository 会定义：
+
+```python
+get_by_sender_id(...)
+save_state(...)
+delete_state(...)
+```
+
+这是人能看懂的业务动作。
+
+而 Session 提供：
+
+```python
+execute(...)
+add(...)
+commit(...)
+rollback(...)
+```
+
+这是更底层的数据库操作能力。
+
+所以：
+
+> **Repository 知道“查什么”，Session 知道“怎么在这一轮事务里查”。**
+
+最后你可以把整个数据库访问层压成这一张：
+
+```text
+┌──────────────┐
+│ Service      │
+│ 业务协调     │
+└──────┬───────┘
+       │
+       │ 调用
+       ▼
+┌──────────────┐
+│ Repository   │
+│ 数据访问封装 │
+└──────┬───────┘
+       │
+       │ 使用
+       ▼
+┌──────────────┐
+│ Session      │
+│ 一次事务上下文│
+└──────┬───────┘
+       │
+       │ 依赖
+       ▼
+┌──────────────┐
+│ Engine       │
+│ 连接/连接池  │
+└──────┬───────┘
+       │
+       │ 访问
+       ▼
+┌──────────────┐
+│ MySQL        │
+│ 真正数据     │
+└──────────────┘
+```
+
+一句话记忆就是：
+
+> **Service 决定做什么，Repository 决定查什么，Session 管这一轮事务，Engine 管怎么连库，MySQL 存真正的数据。**
