@@ -1,0 +1,585 @@
+可以。你这一章其实只是在做一件事：
+
+> **设计一个“用户对话总档案”，让系统记得这个用户聊过什么、现在关注什么、正在办什么任务、任务办到哪一步。**
+
+先不要被一堆 `dataclass` 和字段吓到，整体结构其实很简单。
+
+```text
+DialogueState
+= 某一个用户的完整对话状态
+```
+
+它下面分成两大块：
+
+```text
+DialogueState
+│
+├── shared
+│   = 所有对话类型都可能用到的公共状态
+│
+└── tasks
+    = 只有任务流程才需要的任务状态
+```
+
+也就是：
+
+```text
+用户总状态
+├── 公共记忆
+└── 任务记忆
+```
+
+你可以这样看整张图：
+
+```text
+┌─────────────────────────────┐
+│ DialogueState               │
+│ 某个用户的“总档案”          │
+│ sender_id = 用户是谁         │
+└──────────────┬──────────────┘
+               │
+        ┌──────┴──────┐
+        │             │
+        ▼             ▼
+
+┌──────────────┐   ┌──────────────┐
+│ SharedState  │   │ TaskState    │
+│ 公共状态     │   │ 任务状态     │
+└──────┬───────┘   └──────┬───────┘
+       │                  │
+       │                  │
+   ┌───┴────┐        ┌────┴─────┐
+   │        │        │          │
+   ▼        ▼        ▼          ▼
+
+Focused   Sessions   Active     Paused
+Object              Task       Tasks
+当前关注  历史会话   当前任务    暂停任务
+的对象
+```
+
+---
+
+## 1. `DialogueState`：用户总档案
+
+最外层：
+
+```python
+DialogueState
+```
+
+你就把它理解成：
+
+> **这个用户当前在客服系统里的全部记忆。**
+
+例如用户：
+
+```text
+sender_id = user_001
+```
+
+系统可能记着：
+
+```text
+他刚才点了哪个订单
+他之前聊了哪些内容
+现在有没有正在退款
+退款进行到哪一步
+之前有没有暂停的物流查询任务
+```
+
+所以：
+
+```text
+DialogueState
+= 用户级总状态
+```
+
+---
+
+# 2. SharedState：公共记忆区
+
+```text
+SharedState
+```
+
+是不管用户现在：
+
+```text
+办任务
+查知识
+还是闲聊
+```
+
+都可能用到的信息。
+
+它里面主要有两个东西：
+
+```text
+SharedState
+│
+├── focused_object
+│
+└── sessions
+```
+
+---
+
+## `focused_object`：用户现在盯着什么
+
+例如用户刚刚点击了一张订单卡片：
+
+```text
+订单 A20261014001
+```
+
+那么系统就记：
+
+```text
+focused_object
+=
+当前关注的是这个订单
+```
+
+后面用户说：
+
+```text
+“它什么时候到？”
+```
+
+这里的“它”是谁？
+
+系统就可以根据：
+
+```text
+focused_object
+```
+
+知道：
+
+> 他还在说刚才那张订单。
+
+所以：
+
+```text
+FocusedObject
+= 当前对话里的“这个 / 那个 / 它”到底指谁
+```
+
+例如：
+
+```text
+FocusedObject
+│
+├── type = order
+├── id = A001
+├── title = 我的订单
+└── attributes = 其他扩展信息
+```
+
+---
+
+# 3. Sessions：这个用户聊过的历史
+
+```text
+sessions
+```
+
+就是：
+
+> 这个用户所有历史会话。
+
+例如：
+
+```text
+用户 user_001
+
+sessions
+│
+├── Session 1
+│   10月10日的一次聊天
+│
+├── Session 2
+│   10月12日的一次聊天
+│
+└── Session 3
+    今天正在聊
+```
+
+所以：
+
+```text
+Session
+= 一段连续的聊天
+```
+
+---
+
+## Session 里面又是一轮一轮的 Turn
+
+例如一次聊天：
+
+```text
+用户：你好
+客服：你好
+
+用户：我要退款
+客服：请告诉我订单号
+
+用户：A001
+客服：请告诉我退款原因
+```
+
+实际上是：
+
+```text
+Session
+│
+├── Turn 1
+│   ├── 用户：你好
+│   └── 客服：你好
+│
+├── Turn 2
+│   ├── 用户：我要退款
+│   └── 客服：请告诉我订单号
+│
+└── Turn 3
+    ├── 用户：A001
+    └── 客服：请告诉我退款原因
+```
+
+所以：
+
+```text
+Session
+= 一整段会话
+
+Turn
+= 一问一答的一轮
+```
+
+不过这里稍微特殊一点：
+
+```python
+bot_messages: list[BotMessage]
+```
+
+说明一次用户输入，可以产生多条机器人回复。
+
+例如：
+
+```text
+用户：
+我要退款
+
+机器人：
+好的，我来帮你处理。
+
+机器人：
+请告诉我订单号。
+```
+
+这两条都属于同一个 `Turn`。
+
+所以更准确是：
+
+```text
+Turn
+= 一次用户输入
+  +
+  因这次输入产生的所有机器人回复
+```
+
+---
+
+# 4. TaskState：任务专属记忆
+
+这一块只负责：
+
+> 用户现在正在“办什么事”。
+
+```text
+TaskState
+│
+├── active
+│
+└── paused
+```
+
+非常好理解：
+
+```text
+active
+= 当前正在办理的任务
+
+paused
+= 做到一半暂时放下的任务
+```
+
+例如：
+
+```text
+用户：
+我要退款
+
+系统：
+请给订单号
+
+用户：
+等等，我先问一下这件衣服支持七天无理由吗？
+```
+
+这时退款任务可能先暂停：
+
+```text
+active
+= 当前知识咨询 / 或暂无活动任务
+
+paused
+= refund_request
+```
+
+之后用户说：
+
+```text
+“好，那继续退款吧。”
+```
+
+就可以把之前那个任务恢复回来。
+
+所以：
+
+> `paused` 本质上是在解决“用户会打断任务”这个真实对话问题。
+
+---
+
+# 5. TaskInstance：一项任务做到哪了
+
+这是任务系统里最关键的对象。
+
+```text
+TaskInstance
+```
+
+表示：
+
+> 某一条业务流程的一次具体执行。
+
+里面四个字段非常重要：
+
+```text
+TaskInstance
+│
+├── flow_id
+├── step_id
+├── slots
+└── task_id
+```
+
+可以这样记：
+
+```text
+flow_id
+= 我在办什么事
+
+step_id
+= 办到哪一步了
+
+slots
+= 已经收集到了什么信息
+
+task_id
+= 这一次任务自己的身份证
+```
+
+例如用户正在退款：
+
+```text
+flow_id
+= refund_request
+
+step_id
+= ask_refund_reason
+
+slots
+= {
+    order_number: "A001"
+}
+
+task_id
+= 8f73...
+```
+
+翻译成人话：
+
+```text
+我现在正在：
+退款
+
+已经做到：
+询问退款原因
+
+已经拿到：
+订单号 A001
+
+这一轮退款任务的唯一编号：
+8f73...
+```
+
+所以这一整个对象就是：
+
+```text
+TaskInstance
+= 一张“任务进度卡”
+```
+
+---
+
+# 整个系统用一个例子串起来
+
+假设用户：
+
+```text
+“我要退款”
+```
+
+系统状态可能变成：
+
+```text
+DialogueState
+│
+├── sender_id = user001
+│
+├── shared
+│   │
+│   ├── focused_object = 某个订单
+│   │
+│   └── sessions
+│       └── 今天这次聊天
+│           └── 当前 Turn
+│
+└── tasks
+    │
+    ├── active
+    │   └── TaskInstance
+    │       ├── flow_id = refund_request
+    │       ├── step_id = ask_order_number
+    │       ├── slots = {}
+    │       └── task_id = xxx
+    │
+    └── paused = []
+```
+
+用户说：
+
+```text
+A001
+```
+
+状态更新：
+
+```text
+TaskInstance
+│
+├── flow_id = refund_request
+├── step_id = ask_refund_reason
+├── slots
+│   └── order_number = A001
+└── task_id = xxx
+```
+
+再说：
+
+```text
+尺码不合适
+```
+
+就变成：
+
+```text
+TaskInstance
+│
+├── flow_id = refund_request
+├── step_id = submit
+├── slots
+│   ├── order_number = A001
+│   └── refund_reason = 尺码不合适
+└── task_id = xxx
+```
+
+这就是所谓：
+
+> **状态随着对话不断演化。**
+
+---
+
+# 你可以把整章压缩成这一张图
+
+```text
+DialogueState
+= 一个用户的完整“对话档案”
+
+│
+├── sender_id
+│   = 这是谁
+│
+├── SharedState
+│   = 通用记忆
+│
+│   ├── FocusedObject
+│   │   = 现在在说哪个订单/商品
+│   │
+│   └── Sessions
+│       = 历史聊天
+│
+│       └── Session
+│           = 一段连续聊天
+│
+│           └── Turn
+│               = 一次用户输入
+│                 + 对应机器人回复
+│
+└── TaskState
+    = 任务进度记忆
+
+    ├── active
+    │   = 当前正在做的任务
+    │
+    └── paused
+        = 暂停等待恢复的任务
+
+        TaskInstance
+        │
+        ├── flow_id
+        │   = 做什么
+        │
+        ├── step_id
+        │   = 做到哪一步
+        │
+        ├── slots
+        │   = 已经知道什么
+        │
+        └── task_id
+            = 这一次任务是谁
+```
+
+最简单的一句话总结：
+
+> **`DialogueState` 就是客服系统的“记忆中心”：SharedState 记住用户聊了什么、当前关注什么；TaskState 记住用户正在办什么、办到哪一步。**
+
+而这一章目前只是：
+
+> **先设计“记忆长什么样”。**
+
+还没有讲：
+
+```text
+谁创建它
+谁修改它
+谁保存它
+怎么暂停任务
+怎么恢复任务
+怎么从 MySQL 加载
+```
+
+这些是后续章节才会解决的。
