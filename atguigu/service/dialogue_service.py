@@ -20,10 +20,10 @@ class DialogueService:
                   ) -> ProcessResult:
         # 1.从UserMessage里面得到获取到用户id，调用respository层方法，根据用户id查询用户历史的处理数据
         sender_id = user_message.sender_id
-        dialogue_state: DialogueState = self.repository.load(sender_id)
+        dialogue_state: DialogueState = await self.repository.load(sender_id)
         # 2.调用engine引擎层中的方法处理消息，返回处理结果
         process_result: ProcessResult = self.engine.handle_message(user_message, dialogue_state)
         # 3.保存最新的数据到state中
-        await self.repository.save(dialogue_state)
+        await self.repository.save_or_update(dialogue_state)
         # 4.返回处理结果
         return process_result
