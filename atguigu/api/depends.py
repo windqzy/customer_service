@@ -2,6 +2,7 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from atguigu.engine.dialogue_engine import DialogueEngine
+from atguigu.plan.turn_planner import TurnPlanner
 from atguigu.repository.dialogue_repository import DialogueRepository
 from atguigu.service.dialogue_service import DialogueService
 from atguigu.utils.database import async_session_factory
@@ -19,10 +20,15 @@ async def get_dialogue_repository(session: AsyncSession = Depends(get_sesssion))
         session=session
     )
 
+# 注入turn_planner对象
+async def get_turn_planner() -> TurnPlanner:
+    return TurnPlanner()
 
 # 注入引擎层对象
-async def get_dialogue_engine() -> DialogueEngine:
-    return DialogueEngine()
+async def get_dialogue_engine(turn_planner:TurnPlanner= Depends(get_turn_planner)) -> DialogueEngine:
+    return DialogueEngine(
+        turn_planner=turn_planner
+    )
 
 
 # 注入service对象
