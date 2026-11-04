@@ -1,5 +1,7 @@
 from atguigu.domain.message import UserMessage, BotMessage
 from atguigu.domain.state import DialogueState
+from atguigu.task.action.base import ActionBase, ActionResult
+from atguigu.task.action.runner import ActionRunner
 from atguigu.task.flow.links import FlowStepLink, ConditionalLink, FallbackLink
 from atguigu.task.flow.models import Flow, FlowCatalog
 from atguigu.task.flow.steps import FlowStep, StartFlowStep, CollectSlotStep, ResponseFlowStep, ActionFlowStep, \
@@ -9,8 +11,10 @@ from atguigu.task.response.response_render import ResponseRender
 
 
 class FlowExecutor:
-    def __init__(self, response_render: ResponseRender):
+    def __init__(self, response_render: ResponseRender,
+                 action_runner: ActionRunner):
         self.response_render = response_render
+        self.action_runner = action_runner
 
     async def run_task(self, state: DialogueState,
                        flow_catalog: FlowCatalog) -> list[BotMessage]:
@@ -61,10 +65,23 @@ class FlowExecutor:
             1.根据yaml文件action属性值，找到对应action对象
             2.调用对应action对象方法，实现远程调用得到结果
             3.返回查询结果 放到slots里面，方便下一步进行渲染
+
+            update() 是 Python 字典的方法，把另一个字典里的键和值合并进当前字典
+            你的这行代码：
+            state.tasks.active.slots.update(action_result.slots_update)
+            意思是：把 Action 查询得到的数据，补充到当前任务的槽位中。
+
+
             """
             if isinstance(step, ActionFlowStep):
+                #获取到yaml文件中action的值
                 action_name = step.action
-                # todo
+                #封装为ActionBase对象
+                action_base = ActionBase(action_name=action_name)
+                #调用action_runner中的方法进行实现
+                action_result:ActionResult = await self.action_runner.run(state, action_base)
+                #把action调用返回数据放到state的槽位中
+                state.tasks.active.slots.update(action_result.slots_update)
                 # 推进下一步
                 self._run_next_step(step, state)
                 continue

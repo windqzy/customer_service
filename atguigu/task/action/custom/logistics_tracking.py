@@ -24,7 +24,7 @@ class LogisticsTrackingAction(Action):
             slots_update={
                 'logistics_company': data.get('logistics_company','未知的物流公司'),
                 'tracking_number':data.get('tracking_number','未知的物流编号'),
-                'logistics_status':data.get('logistics_status','未知的物流状态')
+                'logistics_status':data.get('status','未知的物流状态')
             }
         )
 

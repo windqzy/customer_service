@@ -6,6 +6,9 @@ from atguigu.plan.turn_plan_validator import TurnPlanValidator
 from atguigu.plan.turn_planner import TurnPlanner
 from atguigu.repository.dialogue_repository import DialogueRepository
 from atguigu.service.dialogue_service import DialogueService
+from atguigu.task.action.builder import action_register
+from atguigu.task.action.registry import ActionRegistry
+from atguigu.task.action.runner import ActionRunner
 from atguigu.task.command.processor import CommandProcessor
 from atguigu.task.flow.executor import FlowExecutor
 from atguigu.task.handler import TaskHandler
@@ -49,9 +52,24 @@ async def get_response_render() -> ResponseRender:
     return ResponseRender()
 
 
-async def get_flow_executor(response_render: ResponseRender = Depends(get_response_render)) -> FlowExecutor:
+async def get_action_registry() -> ActionRegistry:
+    # 创建注册表，并注册已有的业务 Action
+    registry = ActionRegistry()
+    action_register(registry)
+    return registry
+
+
+async def get_action_runner(
+        registry: ActionRegistry = Depends(get_action_registry),
+) -> ActionRunner:
+    return ActionRunner(registry=registry)
+
+
+async def get_flow_executor(response_render: ResponseRender = Depends(get_response_render),
+                            action_runner:ActionRunner=Depends(get_action_runner)) -> FlowExecutor:
     return FlowExecutor(
-        response_render=response_render
+        response_render=response_render,
+        action_runner=action_runner
     )
 
 
@@ -97,28 +115,36 @@ async def get_dialogue_service(repository: DialogueRepository = Depends(get_dial
 
 
 """
-FastAPI 接口
-   │
-   ▼
-get_dialogue_service()
-   │
-   ├───────────────┐
-   ▼               ▼
-get_dialogue_repository()   get_dialogue_engine() 
-   │                         │                   │   
-   ▼                         ▼                   ▼
-get_session()            get_turn_planner()     get_task_handler()
-   │                         │
-   ▼                         ▼
-AsyncSession             TurnPlanner
-   │                         │
-   ▼                         ▼
-DialogueRepository       DialogueEngine
-        \\                 /
-         \\               /
-          ▼             ▼
-           DialogueService
-
+chat 接口
+└── get_dialogue_service() → DialogueService
+    │
+    ├── get_dialogue_repository() → DialogueRepository
+    │   └── get_sesssion() → AsyncSession
+    │       └── async_session_factory()
+    │
+    └── get_dialogue_engine() → DialogueEngine
+        │
+        ├── get_turn_planner() → TurnPlanner
+        │
+        ├── get_turn_planner_validator() → TurnPlanValidator
+        │
+        └── get_task_handler() → TaskHandler
+            │
+            ├── get_command_processor() → CommandProcessor
+            │
+            ├── get_task_lifecycle_responder()
+            │   └── TaskLifecycleResponder
+            │
+            └── get_flow_executor() → FlowExecutor
+                │
+                ├── get_response_render() → ResponseRender
+                │
+                └── get_action_runner() → ActionRunner
+                    │
+                    └── get_action_registry() → ActionRegistry
+                        └── action_register(registry) 手动注册
+                            ├── LogisticsTrackingAction
+                            └── LookupOrderStatusAction
 
 API 只声明自己要什么，FastAPI 沿着 Depends 递归创建 Session、Repository、Planner、Engine，最后组装成 Service。
 """
