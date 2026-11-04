@@ -2,10 +2,12 @@ import uvicorn
 
 from atguigu.conf.config import settings
 from atguigu.utils.database import init_db_engine
+from atguigu.utils.http_client import init_http_client
 
 if __name__ == '__main__':
     
     init_db_engine()
+    init_http_client()
     uvicorn.run("atguigu.api.app:app",
                 host=settings.app_host,
                 port=settings.app_port,

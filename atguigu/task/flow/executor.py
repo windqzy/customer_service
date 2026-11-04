@@ -200,3 +200,40 @@ FlowExecutor（你贴的这段代码）： 是一个**“自动挂机脚本”**
 ┃    状态：彻底退出循环！(return bot_messages 📤)                  ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 """
+
+"""
+- id: ask_order_number
+  type: collect
+  slot_name: order_number
+  template:
+    text: "请告诉我你的订单号。"
+  next: lookup_logistics
+
+你这次请求的执行顺序是：
+
+大模型识别出 start_flow: logistics_tracking，启动物流查询任务。
+TaskLifecycleResponder 生成第一句话：“好的，现在开始执行 物流查询”。
+FlowExecutor 从 start 推进到 ask_order_number。
+检查 slots，发现没有 order_number，于是生成第二句话。
+生成第二句话的关键代码在 executor.py 第 110 行：
+
+if not slot_value:
+    message = await self.response_render.render(
+        step.template,  # 这里就是 YAML 中的“请告诉我你的订单号。”
+        state
+    )
+    bot_messages.append(message)
+    return False
+
+render() 再将文本包装为：
+
+BotMessage(text="请告诉我你的订单号。")
+
+最后，TaskHandler 把两个来源的消息合并：
+
+messages.extend(bot_messages)
+
+所以你在一个响应中看到了两句话。
+
+容易忽略的地方：collect 步骤也会生成回复。 缺少信息时，它需要发问，然后停在当前步骤，等待用户下一次提供订单号。
+"""
