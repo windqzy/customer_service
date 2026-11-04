@@ -5,9 +5,11 @@ import time
 import uuid
 from pathlib import Path
 
+from atguigu.chichat.chitchat import ChitChat
+from atguigu.clarify.clarify_response import ClarifyResponse
 from atguigu.domain.message import UserMessage, MessageType, ProcessResult, BotMessage
 from atguigu.domain.state import DialogueState, Turn
-from atguigu.plan.models import TurnPlan
+from atguigu.plan.models import TurnPlan, TurnPlanValidationResult
 from atguigu.plan.turn_plan_validator import TurnPlanValidator
 from atguigu.plan.turn_planner import TurnPlanner
 from atguigu.task.flow.loader import FlowLoader
@@ -18,12 +20,15 @@ from atguigu.task.handler import TaskHandler
 class DialogueEngine:
 
     def __init__(self, turn_planner: TurnPlanner,
-                 turn_planner_validator:TurnPlanValidator,
-                 task_handler:TaskHandler,):
+                 turn_planner_validator: TurnPlanValidator,
+                 task_handler: TaskHandler,
+                 chit_chat: ChitChat,
+                 clarify_response: ClarifyResponse):
         self.turn_planner = turn_planner
         self.turn_planner_validator = turn_planner_validator
         self.task_handler = task_handler
-
+        self.chit_chat = chit_chat
+        self.clarify_response = clarify_response
 
     async def handle_message(self, user_message: UserMessage,
                              dialogue_state: DialogueState) -> ProcessResult:
@@ -97,31 +102,36 @@ class DialogueEngine:
                                                            )
 
         # 2.对意图识别结果进行校验
-        validation_result:TurnPlanValidator = self.turn_planner_validator.validate(
-            turn_plan= turn_plan,
+        validation_result: TurnPlanValidationResult = self.turn_planner_validator.validate(
+            turn_plan=turn_plan,
             flow_catalog=flow_catalog,
             state=dialogue_state)
 
-        #3.如果校验失败，执行反问澄清组件
+        # 3.如果校验失败，执行反问澄清组件
         if not validation_result.valid:
-            pass
+            assert validation_result.reason is not None, "校验失败时必须提供澄清原因"
+            result = await self.clarify_response.handle(state=dialogue_state,
+                                         user_message=user_message,
+                                         reason=validation_result.reason)
+            return result
 
-        #4.如果校验成功，根据识别结果，执行不同个系统能力组件
-        if turn_plan.task:#执行任务流程处理器
-            result:list[BotMessage] = await self.task_handler.handle(
+        # 4.如果校验成功，根据识别结果，执行不同个系统能力组件
+        if turn_plan.task:  # 执行任务流程处理器
+            result: list[BotMessage] = await self.task_handler.handle(
                 commands=turn_plan.task.commands,
                 state=dialogue_state,
                 flow_catalog=flow_catalog
             )
 
-        if turn_plan.knowledge:#执行知识检索处理器
-            pass
-        else:#执行闲聊
-            pass
-
+        elif turn_plan.knowledge:  # 执行知识检索处理器
+            result = []  # TODO：知识检索尚未实现
+        else:  # 执行闲聊
+            result = await self.chit_chat.handle(
+                state=dialogue_state,
+                user_message=user_message,
+            )
         return result
-
 
     # 处理对象类型消息的方法
     async def _handle_object_message(self, user_message, dialogue_state) -> list[BotMessage]:
-        pass
+        return []  # TODO：对象消息处理尚未实现

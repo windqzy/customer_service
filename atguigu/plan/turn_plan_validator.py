@@ -100,7 +100,7 @@ class TurnPlanValidator:
         )
 
     # todo
-    def _validation_knowledge(self):
+    def _validation_knowledge(self, turn_plan: TurnPlan):
         return TurnPlanValidationResult(
             valid=True
         )
