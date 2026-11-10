@@ -8,7 +8,8 @@ from atguigu.plan.turn_plan_validator import TurnPlanValidator
 from atguigu.plan.turn_planner import TurnPlanner
 from atguigu.repository.dialogue_repository import DialogueRepository
 from atguigu.service.dialogue_service import DialogueService
-from atguigu.task.action.builder import action_register
+# from atguigu.task.action.builder import action_register
+from atguigu.task.action.builder import auto_action_register
 from atguigu.task.action.registry import ActionRegistry
 from atguigu.task.action.runner import ActionRunner
 from atguigu.task.command.processor import CommandProcessor
@@ -57,7 +58,8 @@ async def get_response_render() -> ResponseRender:
 async def get_action_registry() -> ActionRegistry:
     # 创建注册表，并注册已有的业务 Action
     registry = ActionRegistry()
-    action_register(registry)
+    # action_register(registry)  # 原手动注册方式
+    auto_action_register(registry)
     return registry
 
 
@@ -160,7 +162,7 @@ chat 接口
                 └── get_action_runner() → ActionRunner
                     │
                     └── get_action_registry() → ActionRegistry
-                        └── action_register(registry) 手动注册
+                        └── auto_action_register(registry) 自动扫描注册
                             ├── LogisticsTrackingAction
                             └── LookupOrderStatusAction
 
