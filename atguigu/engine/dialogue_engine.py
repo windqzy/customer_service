@@ -3,17 +3,21 @@
 """
 import time
 import uuid
+from dataclasses import asdict
+from encodings import normalize_encoding
 from pathlib import Path
 
 from atguigu.chichat.chitchat import ChitChat
 from atguigu.clarify.clarify_response import ClarifyResponse
 from atguigu.domain.message import UserMessage, MessageType, ProcessResult, BotMessage
-from atguigu.domain.state import DialogueState, Turn
-from atguigu.plan.models import TurnPlan, TurnPlanValidationResult
+from atguigu.domain.state import DialogueState, Turn, FocusedObject
+from atguigu.plan.command import SetSlotsCommand
+from atguigu.plan.models import TurnPlan, TurnPlanValidationResult, ClarifyReason
 from atguigu.plan.turn_plan_validator import TurnPlanValidator
 from atguigu.plan.turn_planner import TurnPlanner
 from atguigu.task.flow.loader import FlowLoader
-from atguigu.task.flow.models import FlowCatalog
+from atguigu.task.flow.models import FlowCatalog, Flow
+from atguigu.task.flow.steps import FlowStep, CollectSlotStep
 from atguigu.task.handler import TaskHandler
 
 
@@ -133,5 +137,102 @@ class DialogueEngine:
         return result
 
     # 处理对象类型消息的方法
-    async def _handle_object_message(self, user_message, dialogue_state) -> list[BotMessage]:
-        return []  # TODO：对象消息处理尚未实现
+    async def _handle_object_message(self, user_message:UserMessage,
+                                     state:DialogueState) -> list[BotMessage]:
+        path = Path(__file__).parents[2] / 'flow_config' / 'user_flows.yml'
+        flow_catalog: FlowCatalog = FlowLoader().load(path)
+
+        #1.把对象类型的消息封装到focused_object里面去
+        state.shared.focused_object = FocusedObject(
+            **asdict(user_message.object)
+        )
+        #2.判断是否匹配当前任务正在的槽位数据
+        is_fill:bool = self.is_can_fill_slots(state,flow_catalog)
+        if is_fill: #匹配
+            # 获取槽位字典数据
+            slots = {}
+            if user_message.object.type == 'order':
+                slots = {'order_number':user_message.object.id}
+            if user_message.object.type == 'product':
+                slots = {'product_id':user_message.object.id}
+            #因为对象类型消息没有意图识别，无法直接调用TaskHandler方法
+            #手动的那个创建意图识别结果对象，为了可以调用TaskHandler方法
+            #槽位数据 SetSlotsCommand
+            command = SetSlotsCommand(
+                command = 'set_slots',
+                slots = slots
+            )
+
+
+            #调用TaskHandler方法
+            return await self.task_handler.handle(
+                commands=[command],
+                state=state,
+                flow_catalog=flow_catalog
+            )
+
+        else: #无法匹配
+            #收到的对象不能直接用于当前任务补槽，就先问用户“你想对这个对象做什么”。
+            return await self.clarify_response.handle(state=state,
+                                               user_message=user_message,
+                                               reason=ClarifyReason.OBJECT_REQUIRES_INTENT)
+    """
+    第一轮：
+    用户：“我要查物流。”
+        ↓
+    模型规划 start_flow(logistics_tracking)
+        ↓
+    创建物流任务
+        ↓
+    流程停在 collect(order_number)
+        ↓
+    机器人：“请告诉我你的订单号。”
+        ↓
+    保存任务进度
+    
+    第二轮：
+    用户发送订单 1001 的卡片
+        ↓
+    记录 focused_object
+        ↓
+    确认当前正好需要 order_number
+        ↓
+    程序生成 set_slots(order_number="1001")
+        ↓
+    补齐参数，继续原来的物流任务
+        ↓
+    查询并回复物流结果
+    
+
+    """
+
+    #用户刚发送的订单或商品卡片，能不能填入当前任务正在等待的那个槽位？
+    def is_can_fill_slots(self, state:DialogueState,flow_catalog: FlowCatalog) -> bool:
+        #1.当前是否有活跃任务
+        active_task = state.tasks.active
+        if not active_task:
+            return False #此时没有活跃任务不知道用户想要干嘛 所以澄清回复
+        #2.如果有活跃任务，活跃任务步骤类型应该是collect类型
+        flow:Flow = flow_catalog.get_flow_by_id(active_task.flow_id)
+        #获取active里面的step_id
+        step_id = active_task.step_id
+        #根据step_id获取步骤对象
+        step:FlowStep = flow.get_step_by_id(step_id)
+
+        #步骤类型 collect类型
+        if not isinstance(step, CollectSlotStep):
+            return False
+
+        #如果需要订单号，对象类型消息order
+        if step.slot_name == 'order_number' and state.shared.focused_object.type == 'order':
+            return True
+        #如果需要商品id，对象类型消息product
+        if step.slot_name == 'product_id' and state.shared.focused_object.type == 'product':
+            return True
+        return False
+
+
+
+
+
+
