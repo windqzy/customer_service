@@ -16,6 +16,10 @@ class DialogueService:
         self.repository = repository
         self.engine = engine
 
+    # 查询历史状态，不执行新的对话处理
+    async def get_history_sender_id(self, sender_id: str) -> DialogueState:
+        return await self.repository.load(sender_id)
+
     async def run(self, user_message: UserMessage,
                   ) -> ProcessResult:
         # 1.从UserMessage里面得到获取到用户id，调用respository层方法，根据用户id查询用户历史的处理数据

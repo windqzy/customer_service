@@ -1,0 +1,196 @@
+迁移步骤、验证方法与当前缺口
+核对范围：075805a 及整理期间的工作区；路径相对于项目根目录。
+
+一、迁移目标：把电商客服换成 IT 报修助手
+
+先只实现“查询报修工单状态”这一条最小业务链路。
+本节是新项目实施示例，不表示当前项目已经存在这些业务能力。
+
+电商项目的概念                  新项目中的对应概念
+物流查询 logistics_tracking     工单查询 ticket_status_query
+订单号 order_number             工单号 ticket_number
+物流状态 logistics_status       工单状态 ticket_status
+商城物流查询 Action             工单系统查询 Action
+商城 HTTP Client                工单系统 Client
+物流结果模板                    工单状态模板
+DialogueState/TaskInstance      保留运行状态结构，核对身份与会话规则
+FlowExecutor                    保留步骤解释机制，修复已知缺口
+TurnPlanner                     保留计划协议，替换业务目录和提示词示例
+
+可以优先复用设计和接口；不要未经核对就复制整个目录及环境配置。
+
+二、先写清业务契约，再搭建分层
+
+用户说：“帮我查一下报修进度。”
+期望：启动工单查询任务，缺工单号时发问并保存当前位置。
+
+用户下一轮说：“工单号是 T1001。”
+期望：填入当前任务槽位，从暂停的位置继续，查询后返回真实工单状态。
+
+先确定：
+  必需输入：ticket_number，类型 string。
+  外部事实：ticket_status，只能来自工单系统的查询结果。
+  未找到工单、接口超时、缺参数时各返回什么。
+  当前任务完成后，是否恢复之前暂停的任务。
+
+不要让模型从用户的猜测中直接填入“已修复”等业务事实，
+再把这句话当作查询成功的结果。
+
+三、按七个步骤迁移
+
+步骤 1：明确边界和数据协议。
+  定义 UserMessage、BotMessage、DialogueState、TurnPlan、ActionResult。
+  区分外部请求模型、内部业务模型和存储模型。
+  确定身份、会话失效、任务切换和取消的规则。
+
+步骤 2：定义配置和最小流程。
+  建立槽位目录和 ticket_status_query 流程。
+  流程示意：
+
+    start
+      → collect(ticket_number，缺失时提示“请提供工单号。”)
+      → action(action_lookup_ticket_status)
+      → response("工单 {{ slots.ticket_number }}：{{ slots.ticket_status }}")
+      → end
+
+  这是流程规格，非可直接复制的完整 YAML。
+  实际字段应与新项目的 Loader/Step 模型保持一致。
+  在启动阶段检查 next 指向、槽位引用和 action 注册名称。
+
+步骤 3：先验证确定性的执行链路。
+  手工构造 start_flow、set_slots 命令，暂时不依赖模型输出。
+  验证任务创建、缺槽追问、保存当前位置、下一轮继续和任务结束。
+  这样可以区分“执行器有问题”与“模型规划有问题”。
+
+步骤 4：接通 Action，并集中合并结果。
+  编写工单查询 Action，通过 Client 调用接口。
+  将外部状态字段映射成 ActionResult(slots_update={...})。
+  显式注册 Action → 构造 Runner → 注入 Executor。
+  Executor 校验并合并结果，成功后才推进到 response。
+  先用 FakeClient 验证，确认映射和失败行为，再接真实环境。
+
+步骤 5：接入规划和校验。
+  向模型提供工单流程目录、当前任务、已知槽位和有限历史。
+  保留“模型给计划、程序做校验、执行器按流程执行”的边界。
+  计划不合法时停止执行并澄清，不继续写入状态或调用 Action。
+  先只支持一种方向；多方向规划必须有明确调度和回复合并规则。
+
+步骤 6：接入 API、持久化和生命周期。
+  路由只转换协议；Service 组织 load/handle/save。
+  应用启动组装共享资源，请求创建独立数据库 Session。
+  明确快照版本、并发处理、重复消息和外部动作的失败恢复策略。
+
+步骤 7：扩展第二条业务流程，检验抽象是否真的有效。
+  例如“查询设备保修期”，主要新增 YAML、槽位和 Action。
+  如果每加一个同类型业务都要修改 Executor，检查业务细节是否放错层。
+  如果新业务需要人工等待或长任务，再增加有明确语义的新步骤类型。
+  不要为了复用而把所有不同业务硬塞进同一个 action 分支。
+
+四、验证矩阵：不依赖真实模型也能检查大部分设计
+
+场景                     重点观察与预期
+启动任务但缺工单号       返回追问；active.step_id 停在 collect
+下一轮补工单号           继续原任务，而非重复创建一个任务
+首轮已带完整参数         跳过追问；调用一次查询动作并输出结果
+Action 返回状态          slots 写回正确；模板显示接口事实
+未知 action 名称         明确报告配置问题，不出现 None.run 的异常
+接口超时/未找到           不返回伪造成功结果，不误推进为完成
+开始第二个任务           原任务进入 paused，新任务成为 active
+恢复/取消不存在的任务    校验拦截，保留原状态
+模型给非法槽位或命令     不执行，返回明确澄清或错误
+状态保存后重新读取       关键类型、槽位、step_id 和历史保持一致
+同一消息重复发送         按约定复用结果或拒绝重复执行
+同一会话并发两条消息     无静默覆盖，冲突有明确处理方式
+改变启动入口             资源仍能初始化并在退出时关闭
+
+建议按“模型和执行器各自独立验证 → 假依赖集成 → 真实只读查询”推进。
+对真实退款、创建、取消等操作，应使用隔离测试环境和明确的幂等协议。
+这里提供的是验证方案；本次文档整理没有执行这些业务测试。
+
+五、当前代码中的缺口，迁移时不要一并带走
+
+以下是整理时的源码状态；后续修改后请逐项重新核对。
+
+1. Action 已接入，真实业务链路仍需验证。
+   atguigu/api/depends.py
+   atguigu/task/flow/executor.py
+   第十一次提交已补齐 Registry 注册、Runner 注入和 slots_update 写回。
+   FastAPI 内存请求验证了依赖解析和两个 Action 注册成功。
+   仍需验证真实接口响应、结果回填和最终模板输出；第 7 项错误处理尚未完善。
+
+2. 计划校验失败没有阻止执行。
+   atguigu/engine/dialogue_engine.py
+   if not validation_result.valid 后仍是 pass。
+   迁移时将“无效计划不执行”落实为真实分支，而不是仅保留校验类。
+
+3. 非任务方向仍未实现。
+   同一个 Engine 的 knowledge、chitchat、object 分支尚未完成。
+   没有 task 时可能返回未赋值的 result；占位分支也可能返回 None。
+   已支持的入口必须保证消息列表契约；未支持的方向明确返回可理解提示。
+
+4. 校验器规则和提示词协议未完全对齐。
+   atguigu/plan/turn_plan_validator.py
+   提示词允许多个方向，校验器却会拒绝多个方向。
+   知识校验方法定义与调用参数不一致。
+   命令空列表、槽位字段与类型、命令执行顺序也缺少完整检查。
+
+5. 流程推进的边界处理不足。
+   atguigu/task/flow/executor.py
+   仅有一条 next 时直接返回目标，可能跳过条件判断。
+   循环达到 100 次后没有明确错误或返回值。
+   条件通过 eval 执行，不适合直接接收不受信任的配置表达式。
+   迁移时优先采用受限条件协议，并为死循环/无路可走设计明确结果。
+
+6. 收集槽位时混淆“缺失”与“假值”。
+   同一 Executor 中 if not slot_value 会把 0、False 当作缺失。
+   应按槽位规则判断 None、空文本和合法值，不能统一依赖真值判断。
+   对象取槽逻辑使用 step.shared，应核对为 state.shared。
+
+7. 外部响应缺少清晰的失败契约。
+   atguigu/task/action/custom/logistics_tracking.py
+   atguigu/task/action/custom/lookup_order_status.py
+   data 缺失时的默认字符串随后被调用 .get()，会产生异常。
+   对 HTTP 状态、空数据、业务失败应分开处理，再返回统一 ActionResult。
+
+8. 初始化与关闭依赖入口顺序。
+   atguigu/main.py
+   atguigu/utils/database.py
+   atguigu/utils/http_client.py
+   需要将资源创建/释放纳入服务生命周期，并避免保留初始化前的变量引用。
+
+9. 回复模式只实现了静态模板。
+   atguigu/task/response/response_render.py
+   REPHRASE、GENERATE 是扩展位置，不是现成能力。
+   缺失结果字段可能在模板中显示为空，应先检查数据完整性。
+
+10. 快照缺少演进与并发策略。
+    atguigu/repository/dialogue_repository.py
+    整份 JSON 更新，没有配置版本/状态版本、请求去重和并发覆盖保护。
+    历史随每轮增长；迁移时按规模增加历史窗口和归档规则。
+
+六、出问题时按哪条链路定位
+
+现象                          先查什么
+启动时报 coroutine 不可调用   Depends 是否误写成工厂调用结果
+初始化后依赖仍是 None         入口是否执行初始化；是否保留旧导入绑定
+模型识别对了却没有业务结果    校验 → 命令 → 当前 step → Action → slots 写回
+回复中出现空字段              ActionResult、合并位置、模板槽位名
+“请提供订单号”不知从哪来     collect.template → ResponseRender → Handler 合并
+NoneType is not iterable      哪条处理分支没有返回 list[BotMessage]
+数据库已提交却收到 500        commit 后的响应转换是否失败
+某条消息的更新消失            是否多个请求基于同一旧快照写回
+
+观测建议：以 message_id / task_id 串起日志，记录阶段和耗时、
+flow_id、step_id、Action 名称、校验结论与错误类别。
+避免只打印整个大对象，也避免把 API Key 或完整敏感消息写入日志。
+
+七、复制到新项目之前，回答这六个问题
+
+  哪些行为由模型决定，哪些必须由程序决定？
+  哪些是静态规则，哪些是每个用户的运行状态？
+  谁可以修改状态，修改在哪个边界提交？
+  新增业务时要改哪些位置，是否能只增加配置与 Action？
+  外部调用失败、重复消息、并发消息分别如何恢复？
+  不连接真实外部系统时，能否验证整个核心流程？
+
+能清楚回答这些问题，迁移得到的才是可维护的设计，而不仅是一份目录复制。

@@ -5,7 +5,6 @@
 from atguigu.conf.config import settings
 from atguigu.domain.state import DialogueState
 from atguigu.task.action.base import Action, ActionResult
-from atguigu.utils.http_client import http_client
 
 
 class LookupOrderStatusAction(Action):
@@ -18,8 +17,13 @@ class LookupOrderStatusAction(Action):
         # 拼接远程地址
         url = f'{settings.commerce_api_base_url}/orders/{order_number}/status'
         # 远程调用
-        response = await http_client.get(url)
-        data = response.json().get('data', f'未查询到{order_number}的订单状态')
+        response = await self.http_client.get(url)
+        data = response.json().get('data')
+        if not isinstance(data, dict) or not data:
+            return ActionResult(slots_update={
+                'order_status': '未知的订单状态',
+                'order_summary': f'未查询到{order_number}的订单状态',
+            })
         return ActionResult(
             slots_update={
                 'order_status': data.get('status', '未知的订单状态'),

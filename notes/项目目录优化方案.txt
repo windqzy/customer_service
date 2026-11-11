@@ -1,0 +1,83 @@
+项目目录优化方案（供以后自行调整）
+
+这是建议结构，目前没有移动代码。
+目的：把同一类职责放在一起，通过目录就能知道代码属于哪个环节。
+当前目录把技术分层和业务能力放在同一级，并不是不能用，但阅读时需要自己记住分类。
+
+一、建议目录
+
+atguigu/
+├── main.py                 启动入口
+├── api/                    接收请求、返回响应、依赖组装
+│
+├── dialogue/               【安排对话】
+│   ├── service.py          取状态 → 处理 → 保存状态
+│   ├── engine.py           决定交给哪个能力处理
+│   └── plan/               理解用户需求、生成并校验计划
+│
+├── capabilities/           【具体干活】
+│   ├── task/               办理业务：流程、槽位、Action
+│   ├── knowledge/          查询知识：FAQ、RAG、商品订单信息
+│   ├── chitchat/           闲聊
+│   └── clarify/            追问澄清
+│
+├── domain/                 【记录数据】消息、会话、任务状态
+│
+├── infrastructure/         【连接外部系统】
+│   ├── repository/         状态存取、数据库表映射
+│   ├── database.py         数据库连接
+│   ├── http_client.py      HTTP 客户端
+│   └── llm_client.py       大模型客户端
+│
+├── prompts/                提示词和历史消息整理
+└── conf/                   配置
+
+tests/                      项目根目录下的测试代码
+
+二、只记这条主线
+
+api 接待 → dialogue 安排 → capabilities 干活
+                           ↓
+                infrastructure 提供外部连接
+
+domain 记录处理过程中的数据；prompts、conf 提供提示词和配置。
+这是职责图，不表示每个请求都会调用所有能力。
+
+三、旧目录对应哪里
+
+service/dialogue_service.py → dialogue/service.py
+engine/dialogue_engine.py   → dialogue/engine.py
+plan/                      → dialogue/plan/
+task/                      → capabilities/task/
+knowledge/                 → capabilities/knowledge/
+chichat/                   → capabilities/chitchat/（同时修正拼写）
+clarify/                   → capabilities/clarify/
+repository/                → infrastructure/repository/
+utils/ 下的三个客户端文件   → infrastructure/ 下的对应文件
+test/                      → 项目根目录 tests/
+
+api、domain、prompts、conf 和 main.py 先保留原位置。
+flow_config、notes 等项目根目录内容也不需要跟着移动。
+
+四、以后找代码就问自己
+
+“为什么识别成退款？”       → dialogue/plan
+“为什么没有执行退款步骤？” → capabilities/task
+“FAQ 怎么匹配？”           → capabilities/knowledge
+“模型连不上？”             → infrastructure/llm_client.py
+“上一次对话存在哪里？”     → infrastructure/repository
+“用户当前做到哪一步？”     → domain 中的任务状态
+
+五、自己调整时的顺序
+
+1. 先保存一个可回退的 Git 提交，每次只迁移一组包。
+2. 移动文件后，同步修改 import、包的 __init__.py 和 api/depends.py。
+3. 搜索写成字符串的模块路径，特别是 Action 自动扫描的包名。
+4. 检查 Path(__file__).parents[...]：文件层级变化会影响 YAML、提示词等路径。
+5. 同步调整测试导入和启动配置；运行相关功能验证，不需要编译。
+6. 每组确认正常再继续：启动、业务流程、对象补槽、闲聊、澄清。
+   知识问答只验证当时已经实现的部分，不把待实现功能当成迁移成功。
+
+先归组、再修边界：文件搬家不会自动解决模块间的依赖问题。
+例如 domain/state.py 当前引用 task 中的任务事件，以后可以再把这些事件归入 domain。
+不要为了目录整齐增加大量空层级；这次优化的目标是更容易定位和理解代码。

@@ -3,10 +3,11 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from httpx import AsyncClient
+
 from atguigu.conf.config import settings
 from atguigu.domain.message import UserMessage
 from atguigu.domain.state import DialogueState
-from atguigu.utils.http_client import http_client
 
 
 # 1 封装最终结果的类
@@ -28,6 +29,9 @@ class KnowledgeProvider(ABC):
 class ApiProductProvider(KnowledgeProvider):
     provider_id = "api.product"
 
+    def __init__(self, http_client: AsyncClient):
+        self.http_client = http_client
+
     async def run(self,state:DialogueState,
                   user_message:UserMessage)->list[KnowledgeChunk]:
         # 1 从state里面获取商品类型对象里面id值
@@ -38,7 +42,7 @@ class ApiProductProvider(KnowledgeProvider):
 
         # 2 远程调用，根据商品id得到商品信息
         url = f"{settings.commerce_api_base_url}/products/{product_id}"
-        response = await http_client.get(url)
+        response = await self.http_client.get(url)
         data = response.json().get("data","没有信息")
         result = json.dumps(data,ensure_ascii=False)
         return [KnowledgeChunk(content=result)]
@@ -49,6 +53,9 @@ class ApiProductProvider(KnowledgeProvider):
 # 把调用两个接口过程，使用并行方式实现  ，使用httpx封装的方法直接实现
 class ApiOrderProvider(KnowledgeProvider):
     provider_id = "api.order"
+
+    def __init__(self, http_client: AsyncClient):
+        self.http_client = http_client
 
     async def run(self,state:DialogueState,
                   user_message:UserMessage)->list[KnowledgeChunk]:
@@ -65,8 +72,8 @@ class ApiOrderProvider(KnowledgeProvider):
         # 并行调用
         # 注意: gather返回值，和传入参数顺序有关的
         order_info,logistics_info = await asyncio.gather(
-            http_client.get(url1), # 订单状态
-            http_client.get(url2), # 物流信息
+            self.http_client.get(url1), # 订单状态
+            self.http_client.get(url2), # 物流信息
         )
 
         # 得到结果，返回

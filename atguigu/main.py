@@ -1,13 +1,11 @@
 import uvicorn
 
 from atguigu.conf.config import settings
-from atguigu.utils.database import init_db_engine
-from atguigu.utils.http_client import init_http_client
 
 if __name__ == '__main__':
     
-    init_db_engine()
-    init_http_client()
+    # init_db_engine()
+    # init_http_client()
     uvicorn.run("atguigu.api.app:app",
                 host=settings.app_host,
                 port=settings.app_port,
@@ -27,7 +25,8 @@ async_session_factory = None
 仍然为空。老师说的“不是一个对象”，结合你的代码，更准确地理解是：两个进程拥有各自的内存，
 父进程初始化的数据库对象没有自动出现在子进程里。
 正确的调整方向是：在 FastAPI 的 lifespan 中初始化和关闭数据库，让每个服务进程自己完成初始化；
-同时将依赖中的直接变量导入改为读取 database.async_session_factory，避免保留初始化前的 None。
+启动时将资源保存到 app.state；请求到来后，由 Depends 获取并注入业务对象。
+main.py 只启动服务，不负责创建数据库和 HTTP 客户端。
 
 
 """

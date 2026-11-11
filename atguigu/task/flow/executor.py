@@ -160,11 +160,11 @@ class FlowExecutor:
             return
 
         # 如果focused_object里面有对象类型消息，槽位数据获取出来
-        if step.slot_name == 'order_number' and step.shared.focused_object.type == 'order':
+        if step.slot_name == 'order_number' and state.shared.focused_object.type == 'order':
             # 设置到state里面去  state.shared.focused_object.id 这个就是对应的订单号
             state.tasks.active.slots.update({step.slot_name: state.shared.focused_object.id})
         # 此时的id对应商品id
-        if step.slot_name == 'product_id' and step.shared.focused_object.type == 'product':
+        if step.slot_name == 'product_id' and state.shared.focused_object.type == 'product':
             state.tasks.active.slots.update({step.slot_name: state.shared.focused_object.id})
 
 

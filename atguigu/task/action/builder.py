@@ -5,6 +5,8 @@ import importlib
 import inspect
 import pkgutil
 
+from httpx import AsyncClient
+
 from atguigu.task.action.base import Action
 # from atguigu.task.action.custom.logistics_tracking import LogisticsTrackingAction
 # from atguigu.task.action.custom.lookup_order_status import LookupOrderStatusAction
@@ -12,13 +14,13 @@ from atguigu.task.action.registry import ActionRegistry
 
 
 # 手动注册方式，保留供参考
-# def action_register(actionRegistry: ActionRegistry):
-#     actionRegistry.register_action(LogisticsTrackingAction())
-#     actionRegistry.register_action(LookupOrderStatusAction())
+# def action_register(actionRegistry: ActionRegistry, http_client: AsyncClient):
+#     actionRegistry.register_action(LogisticsTrackingAction(http_client=http_client))
+#     actionRegistry.register_action(LookupOrderStatusAction(http_client=http_client))
 
 
 # 通过包扫描注册
-def auto_action_register(actionRegistry: ActionRegistry):
+def auto_action_register(actionRegistry: ActionRegistry, http_client: AsyncClient):
     # 导入包
     package = importlib.import_module('atguigu.task.action.custom')
 
@@ -36,8 +38,8 @@ def auto_action_register(actionRegistry: ActionRegistry):
                 continue
             if action_class.__module__ != module.__name__:
                 continue
-            # 完成注册
-            actionRegistry.register_action(action_class())
+            # 创建 Action 时注入共享客户端，然后完成注册。
+            actionRegistry.register_action(action_class(http_client=http_client))
 
 """
 1. package.__path__：去哪里找？

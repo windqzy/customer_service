@@ -12,10 +12,13 @@ from atguigu.domain.state import DialogueState
 from atguigu.plan.models import ClarifyReason
 from atguigu.prompts.history_builder import HistoryBuilder
 from atguigu.prompts.loader import load_prompt
-from atguigu.utils.llm_client import llm
+from langchain_core.language_models import BaseChatModel
 
 
 class ClarifyResponse:
+    def __init__(self, llm: BaseChatModel):
+        self.llm = llm
+
     # reason:ClarifyReason 失败原因
     async def handle(self,
                      state: DialogueState,
@@ -26,7 +29,7 @@ class ClarifyResponse:
         prompt = PromptTemplate.from_template(template=prompt_text,
                                               template_format='jinja2')
         # 2.创建调用链
-        chain = prompt | llm | StrOutputParser()
+        chain = prompt | self.llm | StrOutputParser()
         # 3.调用
         result = await chain.ainvoke(
             {

@@ -1,5 +1,9 @@
-from fastapi import Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from collections.abc import AsyncIterator
+
+from fastapi import Depends, Request
+from httpx import AsyncClient
+from langchain_core.language_models import BaseChatModel
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from atguigu.chichat.chitchat import ChitChat
 from atguigu.clarify.clarify_response import ClarifyResponse
@@ -21,12 +25,26 @@ from atguigu.task.flow.executor import FlowExecutor
 from atguigu.task.handler import TaskHandler
 from atguigu.task.response.response_render import ResponseRender
 from atguigu.task.tasklifecycle.task_lifecycle_responder import TaskLifecycleResponder
-from atguigu.utils.database import async_session_factory
 
 
-# 注入session
-async def get_sesssion() -> AsyncSession:
-    async with async_session_factory() as session:
+# 从当前应用中取出启动时已创建的资源。
+def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
+    return request.app.state.async_session_factory
+
+
+def get_http_client(request: Request) -> AsyncClient:
+    return request.app.state.http_client
+
+
+def get_llm(request: Request) -> BaseChatModel:
+    return request.app.state.llm
+
+
+# 工厂由应用共享，每次请求创建自己的 session，请求结束时自动关闭。
+async def get_sesssion(
+        session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+) -> AsyncIterator[AsyncSession]:
+    async with session_factory() as session:
         yield session
 
 
@@ -38,8 +56,8 @@ async def get_dialogue_repository(session: AsyncSession = Depends(get_sesssion))
 
 
 # 注入turn_planner对象
-async def get_turn_planner() -> TurnPlanner:
-    return TurnPlanner()
+async def get_turn_planner(llm: BaseChatModel = Depends(get_llm)) -> TurnPlanner:
+    return TurnPlanner(llm=llm)
 
 
 # 注入turn_planner_validator对象
@@ -59,11 +77,13 @@ async def get_response_render() -> ResponseRender:
     return ResponseRender()
 
 
-async def get_action_registry() -> ActionRegistry:
+async def get_action_registry(
+        http_client: AsyncClient = Depends(get_http_client),
+) -> ActionRegistry:
     # 创建注册表，并注册已有的业务 Action
     registry = ActionRegistry()
-    # action_register(registry)  # 原手动注册方式
-    auto_action_register(registry)
+    # action_register(registry, http_client)  # 原手动注册方式
+    auto_action_register(registry, http_client)
     return registry
 
 
@@ -93,26 +113,28 @@ async def get_task_handler(command_processor: CommandProcessor = Depends(get_com
     )
 
 
-async def get_chit_chat() -> ChitChat:
-    return ChitChat()
+async def get_chit_chat(llm: BaseChatModel = Depends(get_llm)) -> ChitChat:
+    return ChitChat(llm=llm)
 
 
-async def get_clarify_response() -> ClarifyResponse:
-    return ClarifyResponse()
+async def get_clarify_response(llm: BaseChatModel = Depends(get_llm)) -> ClarifyResponse:
+    return ClarifyResponse(llm=llm)
 
 
 # 注册知识查询来源
-async def get_knowledge_registry() -> KnowledgeProviderRegistry:
+async def get_knowledge_registry(
+        http_client: AsyncClient = Depends(get_http_client),
+) -> KnowledgeProviderRegistry:
     return KnowledgeProviderRegistry(provider_objs=[
-        ApiProductProvider(),
-        ApiOrderProvider(),
+        ApiProductProvider(http_client=http_client),
+        ApiOrderProvider(http_client=http_client),
         FAQProvider(),
         RAGProvider(),
     ])
 
 
-async def get_knowledge_responder() -> KnowledgeResponer:
-    return KnowledgeResponer()
+async def get_knowledge_responder(llm: BaseChatModel = Depends(get_llm)) -> KnowledgeResponer:
+    return KnowledgeResponer(llm=llm)
 
 
 async def get_knowledge_handler(
@@ -166,7 +188,7 @@ chat 接口
     │
     ├── get_dialogue_repository() → DialogueRepository
     │   └── get_sesssion() → AsyncSession
-    │       └── async_session_factory()
+    │       └── get_session_factory() → app.state.async_session_factory
     │
     └── get_dialogue_engine() → DialogueEngine
         │
@@ -200,9 +222,12 @@ chat 接口
                 └── get_action_runner() → ActionRunner
                     │
                     └── get_action_registry() → ActionRegistry
-                        └── auto_action_register(registry) 自动扫描注册
+                        └── auto_action_register(registry, http_client) 自动扫描注册
                             ├── LogisticsTrackingAction
                             └── LookupOrderStatusAction
 
 API 只声明自己要什么，FastAPI 沿着 Depends 递归创建 Session、Repository、Planner、Engine，最后组装成 Service。
+资源顺序：lifespan 创建 → app.state 保存 → Depends 获取 → 构造函数注入。
+get_action_registry 和 get_knowledge_registry 共用 get_http_client() 提供的应用级客户端。
+Planner、ChitChat、ClarifyResponse、KnowledgeResponer 共用 get_llm() 提供的模型。
 """

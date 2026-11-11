@@ -1,0 +1,157 @@
+分层架构与职责边界
+基线：075805a；代码路径均相对于项目根目录。
+
+一、为什么把一条请求拆成多个模块
+
+要解决的问题：
+  如果一个接口函数同时解析 HTTP、读取数据库、组织提示词、调用模型、
+  处理业务、渲染回复，那么换入口、换模型、换数据库都会修改同一大段代码。
+
+当前方案：让每层围绕一个明确职责组织代码。
+
+  API / Router       处理输入输出协议
+       ↓
+  Service            组织一次完整业务调用和状态读写
+       ↓
+  DialogueEngine     组织本轮对话规划、校验和能力分发
+       ↓
+  Planner / Handler / Executor / Renderer
+                     负责各自具体的计算和执行
+
+  Repository         负责状态持久化，被 Service 调用
+  Infrastructure     数据库、模型、HTTP 客户端，被相应组件使用
+  Domain             消息和状态数据，供各层传递
+
+代码锚点：
+  atguigu/api/chat_router.py
+  atguigu/service/dialogue_service.py
+  atguigu/engine/dialogue_engine.py
+  atguigu/repository/dialogue_repository.py
+
+二、每层允许知道什么
+
+Router：
+  输入：ChatRequest。
+  输出：ChatResponse。
+  工作：补 message_id、转换消息类型、调用 Service、转换响应。
+  不应负责：SQL、模型提示词、某个业务流程的步骤循环。
+
+Service：
+  输入：UserMessage。
+  输出：ProcessResult。
+  当前顺序：加载状态 → Engine 处理 → 保存状态。
+  不应负责：根据某句话决定应该查订单还是查物流。
+
+DialogueEngine：
+  输入：UserMessage + DialogueState。
+  输出：ProcessResult，并在处理过程中更新 state。
+  工作：准备聊天会话、调用 Planner、校验和分发、记录 Turn。
+  不应负责：拼接物流 API 路径或直接决定 SQL 表字段。
+
+TaskHandler：
+  工作：命令处理 → 生命周期提示 → 流程推进 → 合并回复。
+  它负责组织任务处理子组件，不负责每个步骤的细节。
+
+FlowExecutor：
+  工作：读取当前任务的 flow_id、step_id，解释步骤与跳转规则。
+  新增一个物流供应商不应修改它的步骤循环。
+
+具体 Action：
+  工作：调用某个真实业务能力，把外部响应转换为统一结果。
+  不应知道 HTTP 聊天接口最终返回的 JSON 长什么样。
+
+Repository：
+  工作：业务状态与数据库表示之间的转换和查询保存。
+  不应生成机器人话术。
+
+三、怎样判断某段代码应放在哪里
+
+问这段代码最主要因为什么变化：
+  请求 JSON 字段变了                  → API schemas / Router
+  一次业务调用的保存顺序变了           → Service
+  任务、知识、闲聊的路由策略变了       → Engine
+  模型的识别规则变了                  → Planner / prompt
+  什么计划可以执行变了                → Validator
+  业务步骤顺序变了                    → YAML
+  业务系统接口字段变了                → 具体 Action
+  话术或展示格式变了                  → 回复模板 / Responder
+  存储技术或表结构变了                → Repository / ORM
+
+这是把“经常一起变化的内容”放在一起，而不是每多几行就新建一个类。
+
+四、为什么传对象，而不是让每个组件自己创建依赖
+
+[当前]
+  DialogueEngine.__init__(planner, validator, task_handler)
+  TaskHandler.__init__(processor, responder, executor)
+  FlowExecutor.__init__(response_render, action_runner)
+  （第十一次提交已补齐 Registry 和 Runner 的依赖组装，见 04。）
+
+解决的问题：
+  组件内部如果自行构造全部依赖，测试或更换实现就必须修改组件代码。
+
+迁移方式：
+  保留普通构造方法接收依赖；由应用入口统一组装对象。
+  FastAPI 项目可用 Depends；命令行、队列消费者也可以手动组装同样的核心对象。
+
+例如测试时：
+  真正的 Engine + 预设返回值的 Planner + 内存 Repository。
+  这样可以检查任务执行，不需要每次等待模型和真实数据库。
+
+代价：
+  类之间的构造参数会增加，需要清晰的组装入口。
+  过小且不需要替换的纯函数，没有必要强行做成注入对象。
+
+五、接口模型、业务模型与 ORM 为什么分开
+
+  ChatRequest/ChatResponse：描述外部 API。
+  UserMessage/DialogueState：描述内部业务。
+  DialogueStates：描述数据库表。
+
+好处：
+  改数据库表名，不需要让客户端改变请求格式。
+  增加 CLI 入口，可以继续使用内部 UserMessage。
+  调整返回文案，不必让 ORM 模型增加展示字段。
+
+代价：
+  需要显式转换，例如 _build_user_message() 和 _build_chat_response()。
+  相似字段容易写重复，必须确认每次映射的含义。
+
+适用范围：
+  小型、单一 CRUD 项目可以少一层映射。
+  多入口、多外部系统、复杂状态项目通常值得保留这些边界。
+
+六、设计模式在本项目里的具体落点
+
+  构造器依赖注入：通过 __init__ 接收 Planner、Executor 等对象。
+  Repository：集中查询和保存 DialogueState。
+  命令对象：StartFlowCommand、SetSlotsCommand 等描述要执行的操作。
+  状态机：active/paused 与 step_id 描述业务运行位置。
+  配置解释执行：FlowExecutor 根据 YAML 加载后的步骤对象推进。
+  策略与注册表：Action.name 对应不同的 Action.run() 实现。
+  数据映射：外部 API 字段转换为 ActionResult.slots_update。
+  事件与展示分离：TaskEvent 交给 LifecycleResponder 转成提示语。
+
+这些名称帮助理解职责，不意味着项目已实现完整框架。
+例如 TaskEvent 当前只是在内存中传递，没有消息队列、订阅总线或事件回放机制。
+
+七、迁移到别的业务时的目录选择
+
+可先采用以下最小结构，再按实际复杂度扩展：
+
+  api/               外部入口
+  application/       Service、Engine 等用例组织
+  domain/            消息、状态、计划和命令协议
+  workflows/         流程定义、加载与执行
+  actions/           外部业务适配
+  infrastructure/    存储、HTTP、模型客户端
+  bootstrap/         配置、资源初始化和对象组装
+
+这是迁移建议，不是当前仓库目录。
+当前 domain/state.py 会导入 task/tasklifecycle/models.py；
+若新项目要求领域层独立，可把事件模型移到 domain/events.py，
+再让任务层依赖领域模型，避免业务数据反向依赖具体处理模块。
+
+记忆问题：
+  “如果我把 FastAPI 换成命令行入口，哪些代码应该不用动？”
+  能直接保留的业务对象和核心组件，就是分层与显式依赖带来的价值。

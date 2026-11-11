@@ -8,10 +8,13 @@ from atguigu.domain.message import UserMessage, BotMessage
 from atguigu.domain.state import DialogueState
 from atguigu.prompts.history_builder import HistoryBuilder
 from atguigu.prompts.loader import load_prompt
-from atguigu.utils.llm_client import llm
+from langchain_core.language_models import BaseChatModel
 
 
 class ChitChat:
+    def __init__(self, llm: BaseChatModel):
+        self.llm = llm
+
     async def handle(self, user_message: UserMessage,
                      state: DialogueState) -> list[BotMessage]:
         # 1.加载提示词
@@ -21,7 +24,7 @@ class ChitChat:
                                               template_format='jinja2'
                                               )
         # 2.创建调用链
-        chain = prompt | llm | StrOutputParser()
+        chain = prompt | self.llm | StrOutputParser()
 
         # 3.调用
         response = await chain.ainvoke(

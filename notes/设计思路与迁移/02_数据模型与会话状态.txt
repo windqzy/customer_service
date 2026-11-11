@@ -1,0 +1,169 @@
+数据模型与会话状态
+基线：075805a；代码路径均相对于项目根目录。
+
+一、先分清规则、运行状态和本轮计划
+
+  FlowCatalog / Flow / FlowSlot / FlowStep
+    → 规则：系统提供什么业务，业务有哪些步骤，需要什么字段。
+
+  DialogueState / TaskInstance
+    → 运行状态：这个用户当前做哪个业务，走到哪里，填了哪些值。
+
+  TurnPlan / Command
+    → 本轮计划：模型理解这条消息后，建议执行哪些操作。
+
+  TaskEvent / BotMessage
+    → 事件：状态刚发生了什么变化。
+    → 消息：最终准备告诉用户什么。
+
+为什么必须分开：
+  规则由所有用户复用，运行值属于具体用户和具体任务。
+  如果把订单号写进 Flow 全局对象，多个用户可能互相覆盖信息。
+  如果把模型建议直接当成状态，未校验的指令就可能改变业务进度。
+
+代码锚点：
+  atguigu/task/flow/models.py
+  atguigu/domain/state.py
+  atguigu/domain/message.py
+  atguigu/plan/models.py
+  atguigu/plan/command.py
+
+二、Flow 与 TaskInstance 的对应关系
+
+  Flow(id="logistics_tracking")
+    ├─ name、description
+    ├─ steps：步骤定义
+    └─ slots：从 collect 步骤提取的槽位定义
+
+  TaskInstance
+    ├─ task_id：这一次任务的身份
+    ├─ flow_id：引用哪份 Flow
+    ├─ step_id：运行到哪个步骤
+    └─ slots：这一次任务的实际值
+
+读取当前步骤：
+  flow = catalog.get_flow_by_id(task.flow_id)
+  step = flow.get_step_by_id(task.step_id)
+
+设计收益：
+  进度保存为少量数据，不需要把完整执行函数、调用栈写入数据库。
+  下一条消息到来时，可以根据规则和进度重新恢复执行。
+
+迁移注意：
+  修改或删除 YAML 步骤后，历史 step_id 可能不再有效。
+  建议为流程定义增加版本标识，明确旧任务继续使用旧配置，
+  或通过显式状态迁移规则切到新版本。
+  当前代码没有配置版本控制；FlowCatalog 也并非全局唯一实例。
+
+三、三种槽位数据不能混用
+
+  FlowSlot(name="order_number", type="text", label="订单号")
+    → 字段说明。
+
+  task.slots = {"order_number": "1001"}
+    → 已经确认/收集到的当前值。
+
+  ActionResult(slots_update={"logistics_status": "运输中"})
+    → 业务动作建议写回的增量结果。
+
+目标更新方式：
+  task.slots.update(action_result.slots_update)
+
+迁移时需要确定：
+  哪些字段可由用户填写？哪些必须由业务系统产生？
+  同名字段重复出现时允许覆盖吗？None 表示空值还是删除？
+  0、False 是否是合法值？怎么区分“没提供”和“提供了空值”？
+  当前只是 dict.update() 的合并思路，没有完整的字段来源与冲突策略。
+
+建议在槽位定义中表达业务约束，而不是只依赖 Any：
+  name、值类型、是否必填、可选值、格式、数据来源、是否允许覆盖。
+  先做确实需要的约束；无须第一天实现通用表单系统。
+
+四、会话、轮次、任务三个层次
+
+  DialogueState
+    ├─ sender_id
+    ├─ shared
+    │    ├─ focused_object：当前引用的订单/商品
+    │    └─ sessions[]：一段段聊天
+    │         └─ turns[]：每轮用户输入和机器人回复列表
+    └─ tasks
+         ├─ active：当前活动任务
+         └─ paused[]：暂时放下、以后可能恢复的任务
+
+为什么一个 Turn 的 bot_message 是列表：
+  一次处理可能同时产生“开始物流查询”和“请告诉我订单号”。
+  所以输入通常是一条消息，输出允许是多条。
+
+为什么需要 paused：
+  用户查询物流途中突然要求退款，不必丢弃前一个任务的已填数据。
+  后续恢复的是那个 TaskInstance，而不是从零创建同名流程。
+
+当前转换规则：
+  开始新任务：旧 active 存入 paused，新任务成为 active。
+  恢复任务：从 paused 取目标任务；若有 active，先把它暂停。
+  取消任务：删除目标 active 或 paused 项。
+  end：清空 active，不自动恢复暂停任务。
+
+当前会话过期：最近活跃时间超过 60 分钟时新建 Session，清空任务和聚焦对象。
+旧会话的 turns 仍留在 sessions 列表，不代表历史已被删除或归档。
+迁移时应按业务重新选择超时策略；不能默认所有任务 60 分钟后作废。
+
+五、ID 的设计原则
+
+  sender_id  → 谁的状态；当前作为持久化记录主键。
+  message_id → 哪条消息；当前只有标识，没有完整去重机制。
+  session_id → 哪段聊天。
+  turn_id    → 哪一轮输入与输出。
+  task_id    → 哪一次业务任务。
+  flow_id    → 哪种流程定义。
+  step_id    → 哪个执行步骤。
+
+迁移建议：
+  不要以 flow_id 代替 task_id；同一种流程可能被执行多次。
+  不要把客户端传来的 sender_id 自动当作身份认证结果。
+  如果新项目有登录用户或租户，应由入口把认证身份映射到状态归属，
+  Repository 和 Action 都沿用同一个归属上下文。
+
+六、Pydantic、dataclass、ORM 各自负责什么
+
+[当前]
+  Pydantic BaseModel：ChatRequest、ChatResponse 等 API 协议。
+  Pydantic BaseSettings：读取配置。
+  dataclass：消息、状态、流程、命令、任务事件、ActionResult。
+  SQLAlchemy ORM：数据库表映射。
+  TypeAdapter(DialogueState)：状态 JSON 的校验与转换。
+
+选择理由：
+  API 边界需要运行时校验；内部数据对象需要清晰字段和方便构造；
+  ORM 需要表达列、主键和数据库映射。
+
+注意：
+  dataclass 的类型提示不会自动检查运行时输入。
+  声明 list[BotMessage] 不会把 None 自动变成列表。
+  @dataclass 自动生成构造方法，但仍需显式确保字段值正确。
+  列表/字典默认值使用 default_factory，使实例拥有独立容器。
+
+例如：
+  slots_update: dict[str, Any] = field(default_factory=dict)
+  意思是：不传值时，为本次实例新建 {}。
+  不会自动把字典更新到其他对象上。
+
+七、状态快照与持久化
+
+  state_json → TypeAdapter.validate_json() → DialogueState
+  DialogueState → TypeAdapter.dump_json().decode() → state_json
+
+当前整份状态保存在单行 JSON 中。
+好处：快速保存复杂嵌套状态，恢复起来直观。
+代价：历史越多，读写体积越大；字段演进和并发覆盖需要额外处理。
+
+迁移建议：
+  为状态增加 schema_version；新增字段提供合理默认值或迁移函数。
+  明确已结束任务是否需要独立归档；当前 active=None 后没有任务档案。
+  规模变大时可将历史消息与当前可执行状态分开保存。
+  不要为了迁移方便，未经判断就丢弃用户历史。
+
+记忆方式：
+  Flow 是操作规程；TaskInstance 是某位用户的进度表；
+  TurnPlan 是这次决定；DialogueState 把这个用户的历史和进度放在一起。

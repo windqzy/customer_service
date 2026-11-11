@@ -9,10 +9,13 @@ from atguigu.domain.state import DialogueState
 from atguigu.knowledge.provider import KnowledgeChunk
 from atguigu.prompts.history_builder import HistoryBuilder
 from atguigu.prompts.loader import load_prompt
-from atguigu.utils.llm_client import llm
+from langchain_core.language_models import BaseChatModel
 
 
 class KnowledgeResponer:
+    def __init__(self, llm: BaseChatModel):
+        self.llm = llm
+
     async def run(self,chunks:list[KnowledgeChunk],
                   state:DialogueState,
                   user_message:UserMessage)->BotMessage:
@@ -21,7 +24,7 @@ class KnowledgeResponer:
         prompt = PromptTemplate.from_template(prompt_text,
                                      template_format="jinja2")
         # 创建调用链
-        chain = prompt | llm | StrOutputParser()
+        chain = prompt | self.llm | StrOutputParser()
         # 调用
         result = await chain.ainvoke({
             # provider返回结果

@@ -1,0 +1,181 @@
+依赖组装、资源生命周期与持久化
+核对范围：075805a 及整理期间的工作区；路径相对于项目根目录。
+
+一、先分清三个问题
+
+  对象怎么创建？             构造函数、工厂函数。
+  对象需要谁来协作？         显式参数、依赖组装。
+  对象何时创建、何时关闭？   生命周期。
+
+把对象传给另一个对象，不代表它自动成为全局单例；
+用 async def 定义工厂，也不代表返回的对象会自动持久化。
+
+二、FastAPI 的 Depends 与 __init__ 各负责什么
+
+代码锚点：atguigu/api/depends.py
+
+  路由声明 Depends(get_dialogue_service)
+    → 框架分析 get_dialogue_service 的 Depends 参数
+    → 继续解析 Repository、Engine 及其依赖
+    → 调用各个工厂，得到对象
+    → 工厂通过普通构造函数组装对象
+    → 将最终 Service 传给路由
+
+例如：
+  async def get_dialogue_engine(
+      turn_planner=Depends(get_turn_planner), ...
+  ):
+      return DialogueEngine(turn_planner=turn_planner, ...)
+
+  class DialogueEngine:
+      def __init__(self, turn_planner, ...):
+          self.turn_planner = turn_planner
+
+第一段中的 Depends 告诉框架“这个参数去哪里获取”。
+第二段只是接收已经创建好的对象，保存引用以便后续调用。
+FastAPI 并没有自动接管所有 __init__，也不会因为类型注解就扫描全项目。
+
+为什么 Depends(get_turn_planner)，而不是 Depends(get_turn_planner())？
+  前者交给框架一个可调用函数；后者会提前调用函数。
+  async 函数提前调用得到的是协程对象，不能当作依赖工厂再调用。
+
+手动调用 get_dialogue_engine() 也不会自动展开 Depends 默认值。
+脱离 Web 框架时，应显式构造 Planner、Handler 等，再传入 Engine。
+因此业务层无需依赖 FastAPI，命令行、测试和其他入口都能复用。
+
+当前依赖树没有使用全局缓存来保证 Service、Engine 等为进程单例。
+一次请求内的依赖复用与整个进程共享同一对象，是不同层次的概念。
+
+三、组装顺序不等于业务执行顺序
+
+  组装：先拿到数据库 Session、Planner、Handler，再创建 Service。
+  执行：收到消息后 load → plan → validate → execute → save。
+
+创建 TurnPlanner 对象，不代表立刻请求大模型。
+创建 ActionRunner 对象，不代表立刻查询订单。
+构造函数应尽量只保存依赖，实际工作由明确的方法触发。
+
+四、每类对象应该活多久
+
+对象                    建议生命周期               原因
+Settings                进程级配置快照             避免到处读取环境变量
+DB Engine/连接池        服务进程生命周期           复用连接，并统一关闭
+HTTP Client             服务进程生命周期           复用连接与超时策略
+FlowCatalog             配置版本生命周期           避免每轮重复读取解析
+ActionRegistry          应用组装后稳定复用         保存已注册能力
+AsyncSession            一次请求或工作单元         隔离事务和并发操作
+DialogueState           业务会话的持久状态         跨请求恢复，非全局共享变量
+TurnPlan/ActionResult   本轮处理过程               临时计划与执行结果
+
+上表是迁移建议，不代表当前已经全部这样实现。
+当前 FlowCatalog 每次处理文本都会重新加载；Registry 已通过依赖工厂组装，
+但没有配置为进程级单例。
+共享 Action 实例时，不要把某位用户的 state 保存为实例属性。
+
+五、启动与关闭要成对设计
+
+当前代码：
+  atguigu/main.py：在 __main__ 中初始化数据库和 HTTP 客户端。
+  atguigu/api/app.py：创建 app、注册路由，尚未配置 lifespan。
+  atguigu/utils/database.py：已有 close_db_engine()。
+  atguigu/utils/http_client.py：已有 close_http_client()。
+  关闭函数尚未接入应用退出过程。
+
+迁移建议：在应用的生命周期管理处统一完成：
+  启动 → 创建客户端/连接池 → 加载并校验配置 → 注册 Action → 开始服务。
+  退出 → 停止接收新任务 → 关闭 HTTP 客户端和连接池。
+  初始化部分失败时，也释放前面已创建的资源。
+
+为什么换一种启动方式或开启 reload 后容易出问题？
+  仅导入 atguigu.api.app:app 不会执行 main.py 的 __main__ 分支。
+  重载和多进程部署时，服务进程也不能依赖另一个进程已修改的全局变量。
+  每个服务进程都应负责自己的资源初始化与释放。
+
+另一个独立问题：
+  from module import client
+  会在当前模块绑定当时的对象；若原模块后来 client = 新对象，
+  先前导入的名称不会跟着重新绑定。
+
+当前数据库依赖和具体 Action 都有直接导入资源变量的写法。
+当前启动顺序可能暂时让它正常工作，换入口后就可能暴露问题。
+迁移时优先显式传入资源，或从应用容器/模块属性读取已初始化对象。
+
+六、配置集中管理，但不要把配置读取散入业务逻辑
+
+当前 Settings 从项目根目录 .env 加载模型、数据库、商城、服务地址等。
+收益是配置缺失可集中发现，业务代码不必各自处理环境变量。
+
+迁移时应让环境差异通过配置或构造参数进入适配器。
+例如 llm_client.py 当前实际使用的 Ollama 地址仍写在代码中，
+更换部署环境时不能只改 .env 就假设所有连接地址都已替换。
+
+调试只输出必要的配置名称和是否加载成功，避免输出 API Key 等值。
+不要把原项目的 .env 或运行状态数据直接复制进公共模板项目。
+
+七、Repository 隔离业务对象与存储结构
+
+代码锚点：
+  atguigu/repository/dialogue_repository.py
+  atguigu/repository/orm/dialogue_states.py
+  atguigu/service/dialogue_service.py
+
+读取：
+  sender_id → SELECT DialogueStates → ORM record
+    → record.state_json → TypeAdapter.validate_json → DialogueState。
+
+写入：
+  DialogueState → TypeAdapter.dump_json → bytes.decode('utf-8')
+    → MySQL INSERT ... ON DUPLICATE KEY UPDATE → commit。
+
+TypeAdapter(DialogueState) 创建的是转换与校验工具；
+真正执行 JSON 转对象的是 validate_json，而不是创建 adapter 的这一行。
+dump_json 返回 JSON 字节；数据库当前 Text 列需要文本，所以再 decode。
+
+业务层用单数 DialogueState；SQL 查询用 ORM 类 DialogueStates。
+查询条件中的类属性必须是映射列，不能拿 dataclass 字段当 SQL 列。
+
+Repository 的好处是以后替换存储时，Engine 仍面向 DialogueState。
+但当前 upsert 是 MySQL 方言，切换数据库不能原样复制 SQL 构造代码。
+
+八、快照存储简单，但更新边界需要明确
+
+当前每轮保存的是整份状态 JSON，含历史会话、消息和任务。
+它便于还原上下文，但不等于事件溯源，也不天然解决并发和去重。
+
+并发例子：
+  请求 A、B 同时读取同一份状态。
+  A 填订单号并保存；B 用旧状态切换任务并保存。
+  最后写入的快照可能覆盖另一条请求的更新。
+
+迁移建议：按会话顺序处理，或增加版本号并做条件更新。
+采用哪种方案取决于并发量、部署方式和业务容忍度。
+单进程内存锁无法自动协调多个服务进程。
+
+当前 message_id 只是消息标识，没有实现请求去重。
+若需要去重，应保存请求处理状态及对应响应，明确重复请求的返回规则。
+
+九、数据库事务不等于整条业务链路的事务
+
+当前 load 后执行模型规划、流程，再 save/commit。
+数据库日志显示 SELECT 会开启事务，慢模型调用可能延长事务持有时间。
+迁移时可采用短事务读取/写入，但要同时设计版本检查以防覆盖更新。
+
+当前 commit 发生在路由构造 ChatResponse 之前：
+  数据保存成功 → 响应转换失败 → HTTP 500。
+所以“客户端没收到成功响应”不等于“数据库没有发生修改”。
+
+同样，外部 Action 已执行成功后，数据库保存仍可能失败。
+数据库回滚不能撤销另一个系统已经完成的退款或工单创建。
+查询动作可按策略重试；写操作应先设计幂等标识、结果查询和恢复路径。
+对这类问题，不能只用 try/except 或增加重试次数来替代一致性设计。
+
+十、迁移前检查
+
+  所有入口是否都能完成资源初始化？
+  退出时是否释放已创建资源？
+  工厂是否为每个必填构造参数提供对象？
+  单个请求的 AsyncSession 是否被错误地跨请求共享？
+  业务层是否能接受假 Client、假 Repository 进行独立验证？
+  同一用户并发消息、重复消息、提交后响应失败分别如何处理？
+
+这些检查关注的是职责和生命周期，不要求把小项目改成庞大的容器框架。

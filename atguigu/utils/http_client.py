@@ -12,28 +12,22 @@ from httpx import AsyncClient
 # 并行调用方法 gather()
 
 
-# 创建http_client
-http_client: AsyncClient | None = None
-
-
 # 两个方法
 # 1.创建对象
-def init_http_client():
-    global http_client
-    http_client = AsyncClient(timeout=20.0)
+def init_http_client() -> AsyncClient:
+    return AsyncClient(timeout=20.0)
 
 
 # 关闭对象
-async def close_http_client():
+async def close_http_client(http_client: AsyncClient):
     await http_client.aclose()
 
 
 async def test():
-    init_http_client()
+    http_client = init_http_client()
     result = await http_client.get('http://localhost:18081/orders/A20260405003')
     print(result.json())
-    await close_http_client()
+    await close_http_client(http_client)
 
 if __name__ == '__main__':
     asyncio.run(test())
-

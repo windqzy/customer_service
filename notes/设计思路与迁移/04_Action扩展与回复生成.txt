@@ -1,0 +1,175 @@
+Action 扩展与回复生成
+基线：075805a；代码路径均相对于项目根目录。
+
+一、Action 要解决什么问题
+
+流程只知道“这一步要查物流”，不应该知道具体 URL、HTTP 响应字段和供应商。
+把这些细节收进具体 Action，执行器可以通过统一接口调用业务能力。
+
+当前组件：
+  ActionBase(action_name)       描述要调用哪个动作。
+  Action(ABC).run(state)        抽象执行协议。
+  ActionResult(slots_update)    动作返回的增量数据。
+  ActionRegistry               名称 → Action 实例的注册表。
+  ActionRunner                 根据名称查找并 await action.run(state)。
+  builder.action_register()    手动注册当前两个 Action。
+
+代码锚点：
+  atguigu/task/action/base.py
+  atguigu/task/action/registry.py
+  atguigu/task/action/builder.py
+  atguigu/task/action/runner.py
+  atguigu/task/action/custom/lookup_order_status.py
+  atguigu/task/action/custom/logistics_tracking.py
+
+二、当前已经写好的内部链路
+
+  ActionBase(action_name="action_lookup_logistics")
+        ↓
+  ActionRunner.run(state, action_base)
+        ↓
+  registry.get_action(action_name)
+        ↓
+  LogisticsTrackingAction.run(state)
+        ├─ 从 active.slots 读取 order_number
+        ├─ GET /orders/{order_number}/logistics
+        └─ ActionResult(slots_update={物流公司、单号、状态})
+
+订单状态 Action：
+  GET /orders/{order_number}/status
+    → status      映射为 order_status
+    → status_desc 映射为 order_summary
+
+这些实现依赖商城响应中 data 的具体字段结构，迁移时需要替换。
+本指南没有调用真实商城，因此不表示已经验证了接口可用性。
+
+三、主流程接入与后续完善
+
+[当前：第十一次提交补充]
+  第十次提交中 ActionFlowStep 仍是 TODO；当前工作区已增加 Runner 调用。
+  depends.py 已增加 get_action_runner()，并向 FlowExecutor 传入 Runner。
+  get_action_registry() 创建注册表，调用 action_register() 注册两个 Action。
+  get_action_runner() 通过 Depends 接收 registry 并传给 ActionRunner。
+  Executor 将 slots_update 合并回 active.slots，再推进后续步骤。
+  已用 FastAPI 内存请求验证依赖组装，尚未验证真实商城完整业务链路。
+  物流响应中的 status 现映射到 logistics_status 槽位。
+
+[目标链路，迁移时可以按此实现]
+
+  应用组装
+    → 创建 Registry
+    → 注册具体 Action
+    → 创建 Runner(registry)
+    → 将 Runner 注入 FlowExecutor
+
+  执行 ActionFlowStep
+    → ActionBase(action_name=step.action)
+    → await runner.run(state, action_base)
+    → 校验 ActionResult [迁移建议，当前尚未实现结果业务校验]
+    → active.slots.update(result.slots_update)
+    → 成功后推进 next
+    → response 模板读取更新后的 slots
+
+当前执行逻辑可简化为：
+
+  result = await self.action_runner.run(
+      state=state,
+      action_base=ActionBase(action_name=step.action),
+  )
+  state.tasks.active.slots.update(result.slots_update)
+  self._run_next_step(step, state)
+
+失败时应保留足够状态，转为可处理的错误或恢复路径。
+不能在调用失败时照常前进，再让模板显示空数据。
+
+四、为什么通过注册表调用
+
+  YAML 的字符串 → Registry → 具体实现。
+
+收益：
+  Executor 不必出现“如果物流就调用 A、如果订单就调用 B”的业务判断。
+  新增能力时只增加 Action 并注册它。
+  测试可以注册假的 Action，完全不请求外部系统。
+
+代价：
+  依赖从代码引用变成字符串匹配，需要检查拼写和注册完整性。
+  当前重复名称会覆盖旧值，查不到名称会返回 None。
+
+迁移建议：
+  注册时检测重复名称；查找失败时抛明确的 UnknownAction 错误。
+  启动时校验 YAML 中所有 action 名称都已注册。
+  小项目优先显式注册，容易看清能力范围。
+  自动包扫描确有需求再增加；当前 builder 里只是手动注册，不是已实现扫描。
+
+五、ActionResult 为什么返回增量数据
+
+问题：Action 如果在很多地方直接修改 state，就难以知道它改了哪些字段。
+
+方案：
+  具体 Action 返回 slots_update，由调用方统一合并。
+  外部字段在 Action 中转换成系统统一的槽位名。
+
+收益：
+  可以检查返回字段、记录变化、模拟动作、控制更新范围。
+  多种供应商的返回格式可以映射到同一组槽位。
+
+边界：
+  当前接口把整个 state 传给 Action，所以“只返回增量”仍是约定，
+  并没有从类型上禁止 Action 直接修改 state。
+
+迁移建议：
+  复杂项目可给 Action 传更小的只读上下文和明确参数。
+  统一定义允许写回的字段、字段来源、失败状态和错误类型。
+  ActionFlowStep 已有 args 字段，但当前 ActionBase 只包含名称，args 尚未传递。
+  若新业务需要配置参数，应把解析、校验和调用协议一起扩展。
+
+六、HTTP 与资源依赖如何注入
+
+[当前]
+  具体 Action 通过 from ...http_client import http_client 使用模块变量。
+  main.py 已增加 HTTP 客户端初始化。
+
+[迁移建议]
+  在应用组装处把 HTTP 客户端或更具体的业务 Client 传给 Action 构造方法。
+  例如 LookupOrderStatusAction(order_client)，Action 不再负责全局客户端查找。
+  测试可以传入 FakeOrderClient，生产环境传入实际 HTTP 实现。
+
+先处理外部响应，再返回结果：
+  确认 HTTP 状态 → 校验 JSON 结构 → 检查业务成功/未找到 → 映射字段。
+
+当前具体缺口：
+  response.json().get('data', '一段文字') 在 data 缺失时得到字符串，
+  后面调用 data.get(...) 会出错；data=null 时也有同类问题。
+  没有显式 HTTP 状态检查和业务错误分支。
+  迁移时应分别处理成功数据、未找到、超时、非法响应，不把它们混为默认文案。
+
+七、回复生成也需要分层
+
+  TaskEvent → LifecycleResponder → 生命周期提示
+    例：开始物流查询、暂停退款、恢复任务、取消任务。
+
+  FlowStep.template + slots → ResponseRender → 步骤消息
+    例：请提供订单号；订单 1001 当前正在运输。
+
+  TaskHandler → 合并两个来源的消息列表。
+
+设计收益：
+  状态变更逻辑不嵌入展示语言，换话术不需要重写任务切换方法。
+  模板可以统一使用业务字段，不直接理解第三方响应格式。
+
+当前 STATIC 已实现，REPHRASE 和 GENERATE 仍是占位。
+模板 from_dict() 当前把 mode 固定为 STATIC。
+
+迁移取舍：
+  精确事实和固定操作提示可用静态模板。
+  自然表达可以改写，但应保持已确认的业务事实。
+  重要字段缺失时先处理数据缺口，不让模板用空字符串掩盖查询失败。
+
+八、别混淆三个名字
+
+  StartFlowCommand：本轮决定启动一个业务任务。
+  StartFlowStep：业务流程内部的起点。
+  ActionFlowStep：流程中需要调用真实业务能力的某一步。
+
+新增一个 Action，不等于新增一种命令，也不一定需要新增一种步骤类型。
+只要业务仍属于“按统一协议调用能力”，保持 action 步骤类型即可。

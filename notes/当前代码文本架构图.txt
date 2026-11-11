@@ -1,0 +1,851 @@
+customer_service 当前代码文本架构图
+基于 2026-11-03 工作区代码；这是当前实现的学习地图。
+
+阅读顺序：先看 01 和 02 掌握主线，再看 03 理解数据，最后跟着 11 跑两轮消息。
+找文件时看 13；理解依赖注入时看 05；分不清回复来源时看 10。
+
+标记说明：
+  [已有] 当前有实际实现，并不表示全部边界情况都完善。
+  [待接] 存在声明、模板或分支，但功能尚未接通。
+  [注意] 当前代码的限制或容易误解之处。
+
+验证范围：
+  实际加载 YAML，运行两轮 Engine → TaskHandler → FlowExecutor → ResponseRender，
+  验证状态 JSON 往返和接口消息转换。
+  两轮 TurnPlan 使用预设结果，不请求大模型，不连接真实数据库。
+  未编译项目，未改动业务代码。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+01 先记住四份数据和一句主线
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+四份数据：
+
+  FlowCatalog      系统有哪些流程，每个流程有哪些步骤和槽位定义？
+  DialogueState    这个用户之前聊了什么，目前在做什么，进行到哪里？
+  TurnPlan         根据这次消息，本轮准备做什么？
+  BotMessage       最后需要给用户看到哪些文字或对象？
+
+一句主线：
+
+  收消息 → 读用户状态 → 规划 → 校验 → 改任务状态 → 推进步骤
+        → 生成回复 → 记录本轮 → 保存状态 → 返回 JSON
+
+其中：
+  Planner 决定本轮要发出哪些命令。
+  CommandProcessor 执行命令，改变当前任务和槽位。
+  FlowExecutor 根据 YAML 规则与任务进度，决定下一步执行什么。
+  Responder / Render 把任务事件、步骤模板变成用户可见的消息。
+
+“计划启动物流流程”与“真正开始执行流程”发生在不同位置。
+“流程走到了 Action 步骤”也不等于“已经查到真实物流数据”。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+02 一次请求的完整调用图：按照实际调用顺序阅读
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+客户端 / 接口调试工具
+  │ POST /api/chat
+  │ {sender_id, message_id?, text?, object?}
+  ▼
+api/schemas.py · ChatRequest
+  │ FastAPI / Pydantic 将请求体解析成请求对象
+  ▼
+api/chat_router.py · chat()
+  │
+  ├─ _build_user_message(chat_request)
+  │    └─ UserMessage
+  │         ├─ 没提供 message_id：生成 UUID
+  │         ├─ 有 text：MessageType.TEXT
+  │         └─ 否则：MessageType.OBJECT
+  │
+  └─ await DialogueService.run(user_message)
+       │
+       ├─ ① await DialogueRepository.load(sender_id)
+       │    ├─ SQL 查询 dialogue_states 表
+       │    ├─ 查到：state_json → DialogueState
+       │    └─ 没查到：DialogueState(sender_id=...)
+       │
+       ├─ ② await DialogueEngine.handle_message(user_message, state)
+       │    │
+       │    ├─ _prepare_current_session(state)
+       │    │    ├─ 没有会话：创建 Session
+       │    │    ├─ 最近会话超过 60 分钟未活跃：清任务，创建新 Session
+       │    │    └─ 未过期：更新 last_activity_at
+       │    │
+       │    ├─ 文本消息 → _handle_text_message()
+       │    │    │
+       │    │    ├─ FlowLoader.load(user_flows.yml) → FlowCatalog
+       │    │    ├─ await TurnPlanner.plan(message, catalog, state)
+       │    │    │    └─ 提示词 + 上下文 → LLM → JSON → TurnPlan
+       │    │    ├─ TurnPlanValidator.validate(plan, catalog, state)
+       │    │    │    └─ TurnPlanValidationResult(valid, reason)
+       │    │    ├─ 校验失败 → 澄清分支 [待接，目前仅 pass]
+       │    │    └─ 业务任务 → await TaskHandler.handle(commands, state, catalog)
+       │    │         │
+       │    │         ├─ ① CommandProcessor.run()
+       │    │         │    ├─ 修改 state.tasks.active / paused / slots
+       │    │         │    └─ 返回 list[TaskEvent]
+       │    │         │
+       │    │         ├─ ② TaskLifecycleResponder.responder(events, catalog)
+       │    │         │    └─ 任务开始/切换/恢复/取消提示 → messages
+       │    │         │
+       │    │         ├─ ③ FlowExecutor.run_task(state, catalog)
+       │    │         │    ├─ 根据 active.flow_id 找 Flow
+       │    │         │    ├─ 根据 active.step_id 找 FlowStep
+       │    │         │    ├─ 执行 start / collect / action / response / end
+       │    │         │    └─ 收集或回复步骤调用 ResponseRender.render()
+       │    │         │         └─ 返回 list[BotMessage]
+       │    │         │
+       │    │         └─ ④ messages.extend(bot_messages) → 合并回复
+       │    │
+       │    ├─ 知识 / 闲聊处理 [待接]
+       │    ├─ 对象消息 → _handle_object_message() [待接]
+       │    │
+       │    ├─ 创建 Turn(user_message=本轮输入, bot_message=本轮回复列表)
+       │    ├─ 追加到 state.shared.sessions[-1].turns
+       │    └─ 返回 ProcessResult(sender_id, message_id, messages)
+       │
+       ├─ ③ await DialogueRepository.save_or_update(state)
+       │    └─ 状态对象 → JSON → MySQL upsert → commit
+       │
+       └─ ④ 返回 ProcessResult
+  │
+  ├─ _build_chat_response(process_result)
+  │    └─ BotMessage → ChatMessage，MessageObject → ChatObject
+  └─ 返回 ChatResponse
+       └─ FastAPI 序列化成 JSON → 客户端
+
+[注意] 图中的校验失败、知识、闲聊和对象消息分支目前没有完整实现。
+当前真正接通的是合法任务计划的基础执行与静态模板回复路径。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+03 你正在看的 Flow 模型：规则、步骤与用户进度如何关联
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+文件：atguigu/task/flow/models.py
+
+FlowCatalog                        整份流程目录
+  ├─ flows: dict[str, Flow]         按流程 ID 找具体流程
+  │    ├─ onboarding              欢迎引导
+  │    ├─ order_status_query      订单状态查询
+  │    ├─ logistics_tracking      物流查询
+  │    ├─ refund_request          退款申请
+  │    ├─ similar_product_recommendation  相似商品推荐
+  │    └─ human_handoff           转人工
+  │
+  └─ slots: dict[str, FlowSlot]    所有槽位的定义，目前 9 个
+       ├─ order_number
+       ├─ order_status / order_summary
+       ├─ tracking_number / logistics_company / logistics_status
+       ├─ product_id
+       ├─ refund_reason
+       └─ recommendation_summary
+
+一个 Flow，例如 logistics_tracking：
+
+Flow
+  ├─ id = "logistics_tracking"            程序使用的流程标识
+  ├─ name = "物流查询"                     用户可读的名字
+  ├─ description = "帮用户查询订单物流..."   给模型理解业务的说明
+  ├─ steps: list[FlowStep]                 这个流程的步骤对象
+  │    ├─ StartFlowStep(id="start")
+  │    ├─ CollectSlotStep(id="ask_order_number")
+  │    ├─ ActionFlowStep(id="lookup_logistics")
+  │    ├─ ResponseFlowStep(id="show_logistics")
+  │    └─ EndFlowStep(id="end")
+  └─ slots: list[FlowSlot]                 从 collect 步骤整理出的槽位定义
+       └─ FlowSlot(name="order_number", type="text", label="订单号", ...)
+
+你选中的字段：
+  steps = 这个流程有哪些步骤。
+  slots = 这个流程通过 collect 收集哪些槽位的定义。
+  name  = 这个流程叫什么名字。
+
+三个查找方法：
+  catalog.get_flow_by_id("logistics_tracking") → 找到物流 Flow
+  flow.get_start_step()                       → 找到 StartFlowStep
+  flow.get_step_by_id("ask_order_number")     → 找到收集订单号步骤
+
+特别区分三种 slots：
+
+  catalog.slots["order_number"]
+      → FlowSlot(name="order_number", type="text", label="订单号", ...)
+      → 槽位的定义，告诉程序和模型这个字段是什么。
+
+  flow.slots
+      → [上面的 FlowSlot 对象]
+      → 当前加载器根据该流程的 collect 步骤选出定义。
+      → 不是该流程所有输出字段的完整清单。
+
+  state.tasks.active.slots
+      → {"order_number": "1001"}
+      → 这个用户当前任务实际收集到的值。
+
+catalog.slots 中还有物流公司等定义，但物流 Flow.slots 目前只有订单号。
+因为物流公司、物流状态属于将来由 Action 查询并填入的结果，
+不对应要求用户填写的 collect 步骤。
+
+规则与进度的连接：
+
+  用户 ccc 的 TaskInstance                    FlowCatalog 中的 Flow
+  ┌──────────────────────────┐              ┌──────────────────────────┐
+  │ task_id = "某个 UUID"     │              │ id = logistics_tracking  │
+  │ flow_id = logistics_...  │ ──按 ID 查找─▶│ steps                    │
+  │ step_id = ask_order_...  │ ──按 ID 查找─▶│   ask_order_number       │
+  │ slots = {}              │              │     slot_name=order_number│
+  └──────────────────────────┘              │     template=请告诉我... │
+                                            └──────────────────────────┘
+
+Flow 保存流程规则；TaskInstance 保存用户在规则中的当前位置和实际数据。
+同一个物流流程，可以对应不同用户的不同 TaskInstance。
+
+[注意] 当前每次处理文本消息都会重新 FlowLoader.load()。
+FlowCatalog 尚未做启动时缓存，也没有实现为全局单例。
+“静态规则”描述的是用途，不表示这些 dataclass 被强制设成不可修改。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+04 YAML 怎样变成这些 Python 对象
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+flow_config/user_flows.yml
+  │ Path.read_text()
+  ▼
+YAML 文本
+  │ yaml.safe_load()
+  ▼
+dict：{"slots": {...}, "flows": {...}}
+  │ FlowLoader.load()
+  ├─ _load_slots()
+  │    └─ 每个槽位字典 → FlowSlot(name=槽位名, **定义)
+  │         └─ slots: dict[str, FlowSlot]
+  │
+  └─ _load_flows()
+       ├─ 找出各流程 collect 步骤的 slot_name
+       │    └─ 从上面的 slots 字典拿定义 → flow.slots
+       ├─ 每个步骤字典 → FlowStep.from_dict()
+       │    └─ TYPE_TO_STEP_CLASS 按 type 选择子类
+       │         start    → StartFlowStep
+       │         collect  → CollectSlotStep
+       │         action   → ActionFlowStep
+       │         response → ResponseFlowStep
+       │         end      → EndFlowStep
+       └─ 组装 Flow(id, name, description, steps, slots)
+            └─ flows: dict[str, Flow]
+  │
+  ▼
+FlowCatalog(flows=flows, slots=slots)
+
+步骤的共同字段：id、type、next、description。
+  collect 额外包含：slot_name、template。
+  action  额外包含：action、args。
+  response 额外包含：template。
+
+next 的转换：
+  next: ask_order_number           → StaticLink(target="ask_order_number")
+  next: [{if: 条件, then: 下一步}]   → ConditionalLink(condition=..., target=...)
+  next: [{else: 兜底步骤}]          → FallbackLink(target=...)
+  next: []                         → []，通常用于 end
+
+template 的转换：
+  template: {text: "请告诉我你的订单号。"}
+      → ResponseTemplate.from_dict()
+      → ResponseTemplate(mode=STATIC, text="请告诉我你的订单号。")
+
+当前加载器将回复模式固定为 STATIC；REPHRASE / GENERATE 还没有接通。
+加载发生时只创建对象，尚未推进任何用户任务，也没有查询物流后台。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+05 启动与依赖注入：对象先怎么来，之后才谈方法怎么执行
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+启动过程：
+
+main.py
+  ├─ 导入 conf/config.py
+  │    └─ Settings 读取项目根目录 .env → settings
+  ├─ init_db_engine()
+  │    ├─ create_async_engine(settings.database_url) → engine
+  │    └─ async_sessionmaker(engine) → async_session_factory
+  └─ uvicorn.run("atguigu.api.app:app", host, port)
+       └─ 导入 api/app.py
+            ├─ 创建 FastAPI()
+            ├─ 导入 chat_router，解析 Depends 依赖声明
+            └─ include_router(chat_router)
+
+当前 reload=True 被注释，没有 app lifespan 初始化/清理逻辑。
+数据库引擎创建后通常在执行 SQL 时才实际建立连接。
+
+请求需要的对象组装图（缩进表示“需要什么”，不是执行时间顺序）：
+
+chat(service=Depends(get_dialogue_service))
+  └─ get_dialogue_service() → DialogueService
+       ├─ get_dialogue_repository() → DialogueRepository
+       │    └─ get_sesssion() → AsyncSession
+       │         └─ async_session_factory()
+       │              async with ...:
+       │                  yield session
+       │              请求依赖清理时退出上下文，关闭数据库会话
+       │
+       └─ get_dialogue_engine() → DialogueEngine
+            ├─ get_turn_planner() → TurnPlanner
+            ├─ get_turn_planner_validator() → TurnPlanValidator
+            └─ get_task_handler() → TaskHandler
+                 ├─ get_command_processor() → CommandProcessor
+                 ├─ get_task_lifecycle_responder() → TaskLifecycleResponder
+                 └─ get_flow_executor() → FlowExecutor
+                      └─ get_response_render() → ResponseRender
+
+每条 get_xxx 依赖函数负责拿到所需对象，然后显式调用构造方法。
+例如：
+
+  async def get_dialogue_engine(
+      turn_planner=Depends(get_turn_planner), ...
+  ):
+      return DialogueEngine(turn_planner=turn_planner, ...)
+
+FastAPI 根据 Depends 调用 get_turn_planner，并把返回值传给依赖函数。
+随后依赖函数里的普通 Python 代码将对象传给 DialogueEngine.__init__。
+__init__ 只接收并保存参数，没有自动寻找 TurnPlanner 的能力。
+
+关键区别：
+  Depends(get_turn_planner)  把可调用函数交给 FastAPI。
+  get_turn_planner()         调用 async 函数，得到协程，需要 await。
+  TurnPlanner()             普通 Python 构造对象。
+
+直接在普通 Python 中调用 get_dialogue_engine()，不会自动解析 Depends。
+依赖组装需要由 FastAPI 的请求依赖解析过程驱动。
+当前各 get_xxx 工厂没有跨请求单例缓存；不要把它们理解成全局容器里的唯一对象。
+
+llm_client.py 的 llm 是另一种情况：模块导入时构造的客户端对象，
+当前指向本机 Ollama；真正模型请求发生在 chain.ainvoke()。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+06 状态对象：用户的“记忆”到底在哪里
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DialogueState                         根据 sender_id 读取和保存
+  ├─ sender_id
+  ├─ shared: SharedState
+  │    ├─ focused_object: FocusedObject | None
+  │    │    └─ type / id / title / attributes
+  │    └─ sessions: list[Session]      用户的一段段聊天会话
+  │         └─ Session
+  │              ├─ session_id
+  │              ├─ started_at / last_activity_at / closed_at
+  │              └─ turns: list[Turn]
+  │                   └─ Turn
+  │                        ├─ turn_id
+  │                        ├─ user_message: UserMessage
+  │                        └─ bot_message: list[BotMessage]
+  │
+  └─ tasks: TaskState
+       ├─ active: TaskInstance | None
+       │    ├─ task_id                 本次业务任务的 UUID
+       │    ├─ flow_id                 使用哪份流程规则
+       │    ├─ step_id                 当前执行到哪个步骤
+       │    └─ slots                  当前任务的真实数据字典
+       └─ paused: list[TaskInstance]   被暂停的任务，可包含不同流程
+
+几个不同的 ID：
+  sender_id  → 谁在说话，用于数据库按用户找状态。
+  message_id → 用户这条消息的标识；当前没有实现基于它的请求去重。
+  session_id → 属于哪段聊天会话。
+  turn_id    → 哪一轮“用户输入 + 机器人回复”。
+  task_id    → 哪一次具体业务任务。
+  flow_id    → 这次任务使用哪份流程规则。
+  step_id    → 正在执行这份规则中的哪个步骤。
+
+不要混淆两个 Session：
+  sqlalchemy.AsyncSession → 执行 SQL 的数据库会话，用完关闭。
+  domain.state.Session    → 用户聊天记录中的会话，跟着状态保存到数据库。
+
+状态如何在模块间改变：
+  Service 从 Repository 取得 state。
+  Engine、CommandProcessor、FlowExecutor 收到同一个 state 对象引用。
+  它们修改 state.tasks.active、slots、turns 时，Service 持有的对象也变了。
+  因此 Engine 返回 ProcessResult 后，Service 仍能保存已经更新的 state。
+  这来自 Python 对象引用传递，不需要 FastAPI 自动同步数据。
+
+TaskEvent 是这次处理过程中的临时事件；FlowCatalog 是配置对象；
+TurnPlan 是本轮计划。当前 Repository 都没有把它们作为独立记录保存。
+保存的是整个 DialogueState，包括历史和仍在进行/暂停的任务。
+任务 end 后 active=None，当前没有独立的已完成任务档案。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+07 大模型怎样从用户消息得到 TurnPlan
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TurnPlanner.plan(user_message, flow_catalog, state)
+  │
+  ├─ prompts/loader.py
+  │    └─ 读取 prompts/jinja2/turn_plan.jinja2
+  │
+  ├─ 准备六份输入
+  │    ├─ user_message
+  │    │    └─ HistoryBuilder.render_user_message()
+  │    │         "USER: 我要查询物流"
+  │    ├─ conversation_history
+  │    │    └─ 当前 Session 以前的 Turn → USER/BOT 文本
+  │    ├─ task_state_json
+  │    │    └─ state.tasks → 当前任务、暂停任务、步骤、槽位
+  │    ├─ focused_object_json
+  │    │    └─ 当前聚焦的订单/商品对象或 null
+  │    ├─ flows_json
+  │    │    └─ Flow 的 id/name/description/slots；当前移除了 steps
+  │    └─ knowledge_intents_json
+  │         └─ 当前传入 {} [知识意图目录待接]
+  │
+  └─ PromptTemplate(jinja2) | llm | JsonOutputParser()
+       │ await chain.ainvoke(...)
+       ▼
+     Python dict
+       │ TurnPlan.from_dict()
+       ▼
+     TurnPlan
+       ├─ task: TaskTurnPlan | None
+       │    └─ commands: list[Command]
+       ├─ knowledge: KnowledgeTurnPlan | None
+       │    └─ intents: list[str]
+       └─ chitchat: ChitchatTurnPlan | None
+
+模型看见的是流程概况与槽位定义；具体步骤仍由执行器按 YAML 推进。
+变量名 flows_json 当前实际装的是 Python 列表，Jinja2 把它插入提示词。
+
+例如用户说“我的订单号是 1001，我要查询物流”：
+
+  模型输出 JSON：
+  {"task":{"commands":[
+      {"command":"start_flow","flow":"logistics_tracking"},
+      {"command":"set_slots","slots":{"order_number":"1001"}}
+  ]},"knowledge":null,"chitchat":null}
+
+  TurnPlan.from_dict()
+    → TaskTurnPlan.from_dict()
+      → Command.from_dict()
+        → COMMAND_NAME_TO_CLASS[command_data["command"]]
+          ├─ "start_flow"  → StartFlowCommand
+          ├─ "set_slots"   → SetSlotsCommand
+          ├─ "resume_task" → ResumeTaskCommand
+          └─ "cancel_task" → CancelTaskCommand
+
+start_flow 这个词由提示词约定；logistics_tracking 来自 YAML；
+1001 来自用户消息。模型选择和填值，Python 把 JSON 转成命令对象。
+
+TurnPlanValidator 当前检查：
+  ├─ 是否识别出方向，没有则 MISSING_TRACK
+  ├─ 是否同时有多个方向，有则 MULTIPLE_TRACKS
+  ├─ start_flow 的 flow 是否存在
+  ├─ resume_task 的任务是否在 paused 中
+  └─ cancel_task 的任务是否存在于 active 或 paused
+
+[注意] 它并未完成全部校验：空命令列表、set_slots 的上下文与字段等仍有缺口。
+提示词允许明确的多意图输出，但当前 validator 会拒绝多个方向。
+Engine 的校验失败分支目前仅 pass，没有真正阻止后续执行。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+08 Command、TaskEvent 与步骤：它们分别负责什么
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Command = 本轮要求做的操作。
+TaskEvent = 操作执行后发生了什么，用于生成任务提示。
+FlowStep = YAML 中规定的业务步骤。
+
+例如：
+  StartFlowCommand(logistics_tracking)
+       ↓ CommandProcessor
+  创建 TaskInstance 并设置 active
+       ↓
+  TaskStarted(TaskLifecycle(flow_id, task_id))
+       ↓ TaskLifecycleResponder
+  “好的，现在开始执行 物流查询”
+       ↓ FlowExecutor 接手当前 active
+  StartFlowStep → CollectSlotStep → ...
+
+命令执行与事件输出：
+
+  start_flow
+    ├─ 查 Flow，找到 start step，创建新的 TaskInstance
+    └─ state.tasks.start_task(task)
+         ├─ 没有 active：新任务成为 active → TaskStarted
+         └─ 已有 active：旧任务加入 paused，新任务成为 active → TaskSwitched
+
+  set_slots
+    └─ active.slots.update(command.slots)
+         └─ 不产生生命周期事件；后面的步骤按新槽位值继续执行
+
+  resume_task
+    └─ 从 paused 中取出匹配 task_id 的任务
+         ├─ 没有 active：恢复为 active → TaskResumed
+         └─ 已有 active：当前任务暂停，目标任务恢复 → TaskSwitched
+
+  cancel_task
+    ├─ 目标是 active：清空 active → TaskCancelled
+    └─ 目标在 paused：从 paused 删除 → TaskCancelled
+         没找到目标则抛 ValueError；取消 active 不会自动恢复 paused。
+
+TaskLifecycle 只有 flow_id 和 task_id，用于描述发生变化的是哪个任务。
+TaskStarted/TaskResumed/TaskCancelled 包含 task。
+TaskSwitched 包含 previous 和 current。
+TaskEvent 是上述四类事件的类型别名，不是额外实例化的一种对象。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+09 FlowExecutor 怎样推进步骤，又在什么时候停下来
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+run_task(state, catalog)
+  │
+  ├─ 没有 active → 返回 []
+  └─ 有 active → 循环，最多 100 次
+       │
+       ├─ flow = catalog.get_flow_by_id(active.flow_id)
+       ├─ step = flow.get_step_by_id(active.step_id)
+       │
+       ├─ start
+       │    └─ 按 next 改 active.step_id → continue
+       │
+       ├─ collect
+       │    ├─ 从 active.slots 取 step.slot_name
+       │    ├─ 取不到：尝试从 focused_object 填入 [这部分当前有缺陷]
+       │    ├─ 取得值：按 next 改 step_id → continue
+       │    └─ 没取得：渲染 step.template → 加入 bot_messages
+       │         → 返回 bot_messages，停在当前 collect 步骤
+       │         → HTTP 请求结束，不会在函数里一直等待用户
+       │
+       ├─ action
+       │    ├─ 当前只取得 step.action，实际业务调用是 TODO
+       │    └─ 仍然推进到 next → continue
+       │
+       ├─ response
+       │    ├─ ResponseRender.render(step.template, state)
+       │    ├─ BotMessage 加入 bot_messages
+       │    └─ 按 next 改 step_id → continue
+       │
+       └─ end
+            ├─ state.tasks.active = None
+            └─ 返回 bot_messages
+
+下一步不靠“steps 列表的下一个索引”决定，而是靠当前步骤的 next 指向。
+steps 保存所有步骤；step_id 是当前指针；next 是指针如何移动的规则。
+
+_get_next_step() 当前的规则：
+  ├─ 只有一个 link：直接取 link.target
+  └─ 多个 link：依次计算 ConditionalLink；否则走 FallbackLink
+
+[注意] 只有一个 link 时没有区分条件链接，可能跳过条件判断。
+超过 100 次循环目前也没有显式返回或抛出异常。
+这些是当前实现边界，不应把执行器理解成已完成所有异常处理。
+
+collect 停下来后如何继续：
+  本次 state.active.step_id 保留在 collect。
+  Repository 把 state 保存。
+  下次同一 sender_id 的消息到来，重新加载 state。
+  Planner 结合任务状态与上一轮问题，通常生成 set_slots。
+  执行器再次来到这个 collect，发现槽位有值，就继续 next。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10 回复从哪里来：一个接口可以同时返回多句话
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+来源 A：任务生命周期提示
+
+  CommandProcessor → TaskEvent → TaskLifecycleResponder
+       ├─ TaskStarted   → “好的，现在开始执行 物流查询”
+       ├─ TaskSwitched  → “好的，先把...暂停，现在开始执行...”
+       ├─ TaskResumed   → “好的，继续刚才...”
+       └─ TaskCancelled → “好的，把...取消”
+
+  文本在 task_lifecycle_responder.py 中通过 f-string 拼接。
+  Flow.name 提供用户可读的业务名称。
+
+来源 B：流程步骤中的模板回复
+
+  CollectSlotStep.template / ResponseFlowStep.template
+       ↓
+  ResponseRender.render(template, state)
+       ↓ STATIC
+  jinja2.Template(template.text)
+       ↓ render(slots=state.tasks.active.slots)
+  BotMessage(text=render_text)
+
+  示例 1：不含变量的追问模板
+    YAML："请告诉我你的订单号。"
+    结果："请告诉我你的订单号。"
+
+  示例 2：含变量的模板
+    YAML："订单{{ slots.order_number }}..."
+    slots：{"order_number":"1001"}
+    结果："订单1001..."
+
+  collect 缺字段时也会生成消息；并不是只有 response 类型步骤才能回复。
+  REPHRASE 与 GENERATE 当前仅有分支和注释，没有实际 LLM 调用。
+
+TaskHandler.handle()
+  ├─ messages = 生命周期提示列表
+  ├─ bot_messages = 执行流程得到的消息列表
+  ├─ messages.extend(bot_messages)
+  └─ return messages
+
+因此：
+  [“开始物流查询”] + [“请告诉我你的订单号。”]
+       → 同一轮里的两个 BotMessage
+       → 同一个 ChatResponse.messages 数组里的两项
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11 两轮物流查询：把所有模块串起来记忆
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+下面的执行结果已用真实代码验证；模型输出使用预设计划。
+
+第一轮：用户 ccc 说“我要查询物流”。
+
+  ① API 把输入转为 UserMessage(TEXT)。
+  ② Repository 按 sender_id=ccc 加载状态；假设这是新用户。
+  ③ Engine 创建 Session，加载 FlowCatalog。
+  ④ Planner 结合提示词，给出示例计划：
+       StartFlowCommand(command="start_flow", flow="logistics_tracking")
+  ⑤ Validator 确认该流程存在。
+  ⑥ CommandProcessor 创建任务：
+       active = TaskInstance(
+           task_id="T1",                  # 示例名，实际为 UUID
+           flow_id="logistics_tracking",
+           step_id="start",
+           slots={}
+       )
+       同时产生 TaskStarted。
+  ⑦ LifecycleResponder 生成“好的，现在开始执行 物流查询”。
+  ⑧ FlowExecutor：
+       start → ask_order_number
+                   ↓
+                slots 没有 order_number
+                   ↓
+                渲染 YAML 的 collect.template
+                   ↓
+                “请告诉我你的订单号。”
+                   ↓
+                停下，step_id 仍为 ask_order_number
+  ⑨ TaskHandler 合并两句话。
+  ⑩ Engine 追加 Turn，Service 保存状态，API 返回消息列表。
+
+第一轮结束时的状态摘要：
+  tasks.active.flow_id = "logistics_tracking"
+  tasks.active.step_id = "ask_order_number"
+  tasks.active.slots = {}
+  shared.sessions[-1].turns = [第一轮输入和两条回复]
+
+第二轮：同一个 sender_id=ccc，说“订单号是1001”。
+
+  ① Repository 读回第一轮保存的 DialogueState。
+  ② Engine 复用未过期的 Session。
+  ③ Planner 能看见三件事：
+       当前消息：订单号是1001
+       活跃任务：物流查询，停在 ask_order_number
+       上轮回复：请告诉我你的订单号。
+     示例输出：SetSlotsCommand(slots={"order_number":"1001"})
+  ④ CommandProcessor 修改同一个 T1 的 slots，不新建任务：
+       active.slots = {"order_number":"1001"}
+     本轮没有任务生命周期事件，因此没有“又开始一个物流任务”的提示。
+  ⑤ FlowExecutor 从保留的 ask_order_number 继续：
+       collect 已有订单号
+         → lookup_logistics(action)
+         → show_logistics(response)
+         → end
+  ⑥ 当前 action 是 TODO，没有查询到真实物流数据。
+     实际静态模板输出：
+       “订单1001 由配送， 物流单号是。 当前进度：。”
+     原因：只有 order_number，其他变量没有填入。
+  ⑦ end 清空 active；Engine 追加第二个 Turn；Service 保存状态。
+
+第二轮结束时：
+  tasks.active = None
+  shared.sessions[-1].turns 有两轮
+  已推进到 end，但不能据此宣称“物流后台查询已完成”。
+
+以后接通 Action 后，目标行为是：
+  lookup_logistics
+    → 根据订单号调用后台服务
+    → 将物流公司、物流单号、物流进度填入 active.slots
+    → show_logistics 才能渲染出完整的实际结果
+
+连续两轮使用相同 sender_id 才会加载同一份用户状态。
+如果换 sender_id，Repository 会查另一条记录，之前的进度也就不同。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12 数据库保存与接口 JSON：两个不同方向的序列化
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+数据库方向：
+
+  dialogue_states 表
+    ├─ sender_id：主键
+    └─ state_json：Text，存整个用户状态 JSON
+          │ load()
+          ▼
+  TypeAdapter(DialogueState).validate_json(record.state_json)
+          │
+          ▼
+  DialogueState 实例
+          │ Engine / TaskHandler 等修改
+          ▼
+  TypeAdapter(DialogueState).dump_json(state).decode("utf-8")
+          │ save_or_update()
+          ▼
+  INSERT ... ON DUPLICATE KEY UPDATE → commit
+
+接口方向：
+
+  请求 JSON → ChatRequest → UserMessage
+  BotMessage 列表 → ProcessResult → ChatResponse → 响应 JSON
+
+相似名字对照：
+  DialogueState  = 业务状态 dataclass。
+  DialogueStates = 映射数据库表的 SQLAlchemy ORM 类。
+  ChatRequest / ChatResponse / ChatMessage = API 边界的 Pydantic 模型。
+  UserMessage / BotMessage / ProcessResult = 内部传递的 dataclass。
+
+为什么保存成功后仍可能返回 500：
+  当前顺序是 Service 保存状态并 commit 后，路由才构造 ChatResponse。
+  如果返回 messages=None，路由遍历它会失败，但此前保存已经完成。
+  这就是之前日志中出现 COMMIT 后又报 NoneType 错误的原因。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13 文件导航：看到一个名字，不知道去哪里时查这里
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+customer_service/
+├─ pyproject.toml / uv.lock       Python 版本、项目依赖与锁定版本
+├─ .env                          本地配置值；本图不展示任何密钥或凭据
+├─ .gitignore                    Git 忽略规则
+├─ README.md                     项目说明入口
+├─ notes/                        学习笔记，不参与请求处理
+├─ flow_config/
+│  └─ user_flows.yml              槽位定义 + 六个业务流程的规则
+└─ atguigu/
+   ├─ main.py                    启动入口，初始化数据库并运行 Uvicorn
+   ├─ conf/config.py             Settings 读取 .env
+   │
+   ├─ api/
+   │  ├─ app.py                  FastAPI 应用与路由注册
+   │  ├─ chat_router.py          POST /api/chat，接口与内部消息转换
+   │  ├─ schemas.py              请求/响应模型；History 模型尚无对应历史接口
+   │  └─ depends.py              按依赖关系创建 Session、Service 等对象
+   │
+   ├─ service/dialogue_service.py  读状态 → 调 Engine → 保存状态
+   ├─ engine/dialogue_engine.py    管理聊天会话，规划、校验、分发，记录 Turn
+   │
+   ├─ domain/
+   │  ├─ message.py              UserMessage、BotMessage、ProcessResult 等
+   │  └─ state.py                聊天历史、活动任务、暂停任务、槽位与状态操作
+   │
+   ├─ repository/
+   │  ├─ dialogue_repository.py  查询状态、JSON 转换、upsert 保存状态
+   │  └─ orm/
+   │     ├─ base.py              SQLAlchemy DeclarativeBase
+   │     └─ dialogue_states.py   dialogue_states 表的映射
+   │
+   ├─ plan/
+   │  ├─ turn_planner.py         组织提示词输入，调用模型，解析计划
+   │  ├─ turn_plan_validator.py  检查识别方向与部分命令合法性
+   │  ├─ models.py              TurnPlan、三个方向、校验结果与原因枚举
+   │  └─ command.py             四种命令及 JSON → 命令类的映射
+   │
+   ├─ prompts/
+   │  ├─ loader.py              读取指定名称的 .jinja2 文件
+   │  ├─ history_builder.py     把历史 Turn 及消息变成 USER/BOT 文本
+   │  └─ jinja2/
+   │     ├─ turn_plan.jinja2    当前已接通的规划提示词
+   │     ├─ clarify_respond.jinja2    澄清改写提示词 [待接]
+   │     ├─ knowledge_respond.jinja2  知识回复提示词 [待接]
+   │     └─ chitchat_respond.jinja2   闲聊回复提示词 [待接]
+   │
+   ├─ task/
+   │  ├─ handler.py             组织命令处理、生命周期提示、步骤执行
+   │  ├─ command/processor.py   按 Command 修改任务状态并产生 TaskEvent
+   │  ├─ tasklifecycle/
+   │  │  ├─ models.py          TaskLifecycle 与四种 TaskEvent
+   │  │  └─ task_lifecycle_responder.py  事件 → 用户可读提示
+   │  ├─ flow/
+   │  │  ├─ models.py          FlowSlot、Flow、FlowCatalog 与查找方法
+   │  │  ├─ loader.py          YAML → Python 流程对象
+   │  │  ├─ steps.py           五种步骤对象与 from_dict 加载逻辑
+   │  │  ├─ links.py           固定、条件、兜底三种下一步链接
+   │  │  └─ executor.py        按 active 的 flow_id/step_id 推进任务
+   │  └─ response/
+   │     ├─ models.py          ResponseTemplate 与 ResponseMode
+   │     └─ response_render.py Jinja2 + 实际 slots → BotMessage
+   │
+   ├─ knowledge/               空包，知识处理未实现
+   ├─ chichat/                 空包，闲聊处理未实现；当前目录名就是 chichat
+   ├─ utils/
+   │  ├─ database.py           异步数据库引擎、会话工厂、关闭方法
+   │  ├─ llm_client.py         当前 Ollama 模型客户端
+   │  └─ http_client.py        HTTP 客户端初始化/关闭与独立调用示例 [未接入 Action]
+   └─ test/test.py             eval 条件表达式的学习示例，并非完整系统测试
+
+各目录的 __init__.py 用于组织 Python 包；当前无需逐个记忆。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14 当前边界：哪些地方只能按“待实现”理解
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 模型规划与真实业务执行是两阶段。
+   当前 Action 分支没有远程调用，HTTP 客户端也未接入主链路。
+
+2. 校验失败后目前只是 pass，仍可能继续执行任务。
+   空 commands 列表没有被当前的 `is None` 判断拦住。
+   knowledge 校验调用传了参数，而方法定义未接收该参数，存在调用错误。
+
+3. knowledge / chitchat / 对象消息 / 澄清分支尚未完成。
+   Engine 的 result 仅在 task 分支赋值；纯知识或闲聊路径不能视为已跑通。
+   第二个 if 的 else 只对应 knowledge，不对应整个三方向选择。
+
+4. ResponseRender 只有 STATIC 路径实际返回 BotMessage。
+   回复模板 from_dict() 当前固定使用 STATIC。
+
+5. focused_object 自动填槽位有入口，但还不能当作完整能力：
+   对象消息处理方法未实现；执行器中写了 step.shared.focused_object，
+   此处应读取 state.shared.focused_object，当前存在属性访问问题。
+
+6. collect 用真假值判断字段是否缺失；0、False、空字符串都会被认为没有值。
+   当前文本订单号示例可运行，但不能直接推广为所有槽位类型的完整校验。
+
+7. 引擎/客户端的资源生命周期还不完善。
+   main.py 当前依赖先初始化数据库、再导入路由的顺序，reload 已注释。
+   依赖文件直接导入 async_session_factory，若初始化顺序变化会持有旧值。
+   不能把当前结构画成已完成 lifespan 管理。
+
+8. 循环超过 100 步、条件链接特殊情况等尚无完整异常处理。
+   这些边界没有在本次绘图中修改。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+15 帮助记忆：每次迷路，只问自己这几个问题
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+读一个文件时问：
+  ① 它拿到什么数据？
+  ② 它有没有修改 DialogueState？修改了哪里？
+  ③ 它返回的是 Plan、Event，还是 Message？
+  ④ 谁调用它，返回结果又交给谁？
+
+按职责速查：
+  “有哪些业务能办？”              → YAML / FlowCatalog
+  “用户刚才说了什么？”            → UserMessage
+  “用户之前聊了什么？”            → state.shared.sessions[].turns
+  “用户当前办到哪一步？”          → state.tasks.active.step_id
+  “订单号在哪里？”                → state.tasks.active.slots
+  “这轮模型决定做什么？”          → TurnPlan.commands
+  “谁把模型命令变成状态变化？”    → CommandProcessor
+  “发生了什么任务变化？”          → TaskEvent
+  “谁说‘开始/暂停/取消’？”         → TaskLifecycleResponder
+  “谁决定继续往下走还是停下追问？”→ FlowExecutor
+  “谁说‘请告诉我订单号’？”        → collect 的 YAML 模板 + ResponseRender
+  “谁把所有回复汇总？”            → TaskHandler
+  “谁记录这一轮聊天？”            → DialogueEngine
+  “谁负责把更新后的状态保存？”    → DialogueService 调 DialogueRepository
+  “谁把内部消息变成接口 JSON？”   → chat_router + API schemas + FastAPI
+
+可以用下面这一行复述整套系统：
+
+  API 收消息，Service 读写状态，Engine 组织本轮处理；
+  Planner 出计划，Validator 做检查，Processor 改任务；
+  Executor 按规则推进，Responder/Render 形成回复，Repository 留住记忆。

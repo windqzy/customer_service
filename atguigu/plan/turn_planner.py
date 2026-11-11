@@ -17,10 +17,13 @@ from atguigu.prompts import history_builder
 from atguigu.prompts.history_builder import HistoryBuilder
 from atguigu.prompts.loader import load_prompt
 from atguigu.task.flow.models import FlowCatalog, Flow
-from atguigu.utils.llm_client import llm
+from langchain_core.language_models import BaseChatModel
 
 
 class TurnPlanner:
+    def __init__(self, llm: BaseChatModel):
+        self.llm = llm
+
     # 用户消息 user_message:UserMessage
     # 流程数据 flow_catalog:FlowCatalog
     # 历史数据 state:DialogueState
@@ -33,7 +36,7 @@ class TurnPlanner:
         # 提示词读取字符串内容，创建langchain提示词对象
         prompt = PromptTemplate.from_template(prompt_text, template_format="jinja2")
         # 创建调用链条
-        chain = prompt | llm | JsonOutputParser()
+        chain = prompt | self.llm | JsonOutputParser()
         # 调用llm实现
         # 准备调用llm需要的数据
         rendered_user_message = HistoryBuilder.render_user_message(user_message)

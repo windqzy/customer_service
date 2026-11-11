@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from httpx import AsyncClient
+
 from atguigu.domain.state import DialogueState
 
 
@@ -23,6 +25,8 @@ class ActionResult:
 
 @dataclass
 class Action(ABC):
+    # 由注册器传入应用启动时创建的客户端，子类直接使用 self.http_client。
+    http_client: AsyncClient
     name=''
     #抽象方法
     @abstractmethod
