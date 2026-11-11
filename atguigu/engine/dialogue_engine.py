@@ -11,6 +11,7 @@ from atguigu.chichat.chitchat import ChitChat
 from atguigu.clarify.clarify_response import ClarifyResponse
 from atguigu.domain.message import UserMessage, MessageType, ProcessResult, BotMessage
 from atguigu.domain.state import DialogueState, Turn, FocusedObject
+from atguigu.knowledge.handler import KonwledgeHandler
 from atguigu.plan.command import SetSlotsCommand
 from atguigu.plan.models import TurnPlan, TurnPlanValidationResult, ClarifyReason
 from atguigu.plan.turn_plan_validator import TurnPlanValidator
@@ -27,12 +28,15 @@ class DialogueEngine:
                  turn_planner_validator: TurnPlanValidator,
                  task_handler: TaskHandler,
                  chit_chat: ChitChat,
-                 clarify_response: ClarifyResponse):
+                 clarify_response: ClarifyResponse,
+                 knowledge_handler:KonwledgeHandler):
         self.turn_planner = turn_planner
         self.turn_planner_validator = turn_planner_validator
         self.task_handler = task_handler
         self.chit_chat = chit_chat
         self.clarify_response = clarify_response
+        self.knowledge_handler = knowledge_handler
+
 
     async def handle_message(self, user_message: UserMessage,
                              dialogue_state: DialogueState) -> ProcessResult:
@@ -128,7 +132,12 @@ class DialogueEngine:
             )
 
         elif turn_plan.knowledge:  # 执行知识检索处理器
-            result = []  # TODO：知识检索尚未实现
+            result = await self.knowledge_handler.handle(
+                intents_knowledge=turn_plan.knowledge.intents,
+                state=dialogue_state,
+                user_message=user_message
+            )
+            return result
         else:  # 执行闲聊
             result = await self.chit_chat.handle(
                 state=dialogue_state,
@@ -230,7 +239,6 @@ class DialogueEngine:
         if step.slot_name == 'product_id' and state.shared.focused_object.type == 'product':
             return True
         return False
-
 
 
 

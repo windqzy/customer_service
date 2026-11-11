@@ -4,6 +4,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from atguigu.chichat.chitchat import ChitChat
 from atguigu.clarify.clarify_response import ClarifyResponse
 from atguigu.engine.dialogue_engine import DialogueEngine
+from atguigu.knowledge.handler import KonwledgeHandler
+from atguigu.knowledge.provider import ApiProductProvider, ApiOrderProvider, FAQProvider, RAGProvider
+from atguigu.knowledge.registry import KnowledgeProviderRegistry
+from atguigu.knowledge.responder import KnowledgeResponer
 from atguigu.plan.turn_plan_validator import TurnPlanValidator
 from atguigu.plan.turn_planner import TurnPlanner
 from atguigu.repository.dialogue_repository import DialogueRepository
@@ -97,19 +101,45 @@ async def get_clarify_response() -> ClarifyResponse:
     return ClarifyResponse()
 
 
+# 注册知识查询来源
+async def get_knowledge_registry() -> KnowledgeProviderRegistry:
+    return KnowledgeProviderRegistry(provider_objs=[
+        ApiProductProvider(),
+        ApiOrderProvider(),
+        FAQProvider(),
+        RAGProvider(),
+    ])
+
+
+async def get_knowledge_responder() -> KnowledgeResponer:
+    return KnowledgeResponer()
+
+
+async def get_knowledge_handler(
+        knowledge_registry: KnowledgeProviderRegistry = Depends(get_knowledge_registry),
+        knowledge_responer: KnowledgeResponer = Depends(get_knowledge_responder),
+) -> KonwledgeHandler:
+    return KonwledgeHandler(
+        knowledge_registry=knowledge_registry,
+        knowledge_responer=knowledge_responer,
+    )
+
+
 # 注入引擎层对象
 async def get_dialogue_engine(turn_planner: TurnPlanner = Depends(get_turn_planner),
                               turn_planner_validator: TurnPlanValidator = Depends(
                                   get_turn_planner_validator),
                               task_handler: TaskHandler = Depends(get_task_handler),
                               chit_chat: ChitChat = Depends(get_chit_chat),
-                              clarify_response: ClarifyResponse = Depends(get_clarify_response)) -> DialogueEngine:
+                              clarify_response: ClarifyResponse = Depends(get_clarify_response),
+                              knowledge_handler: KonwledgeHandler = Depends(get_knowledge_handler)) -> DialogueEngine:
     return DialogueEngine(
         turn_planner=turn_planner,
         turn_planner_validator=turn_planner_validator,
         task_handler=task_handler,
         chit_chat=chit_chat,
-        clarify_response=clarify_response
+        clarify_response=clarify_response,
+        knowledge_handler=knowledge_handler
     )
 
 
@@ -147,6 +177,14 @@ chat 接口
         ├── get_chit_chat() → ChitChat
         │
         ├── get_clarify_response() → ClarifyResponse
+        │
+        ├── get_knowledge_handler() → KonwledgeHandler
+        │   ├── get_knowledge_registry() → KnowledgeProviderRegistry
+        │   │   ├── ApiProductProvider
+        │   │   ├── ApiOrderProvider
+        │   │   ├── FAQProvider
+        │   │   └── RAGProvider
+        │   └── get_knowledge_responder() → KnowledgeResponer
         │
         └── get_task_handler() → TaskHandler
             │

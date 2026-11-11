@@ -8,8 +8,10 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
 from openai.types.conversations import conversation
 
+from atguigu import knowledge
 from atguigu.domain.message import UserMessage
 from atguigu.domain.state import DialogueState
+from atguigu.knowledge.intents import KNOWLEDGE_INTENTS
 from atguigu.plan.models import TurnPlan
 from atguigu.prompts import history_builder
 from atguigu.prompts.history_builder import HistoryBuilder
@@ -61,13 +63,20 @@ class TurnPlanner:
         # 聚焦对象，封装对象类型消息
         focused_object_json = json.dumps(asdict(state.shared.focused_object)
                                          if state.shared.focused_object else None)
-
+        #知识检索范围数据
+        knowledge_intents_json = json.dumps(
+            [{
+                'id':intent.id,
+                'description':intent.description
+            }
+            for intent in KNOWLEDGE_INTENTS.values()]
+        )
         result = await chain.ainvoke(input={
             "user_message": rendered_user_message,
             "conversation_history":conversation_history,
             "focused_object_json":focused_object_json,
             "task_state_json":task_state_json,
-            "knowledge_intents_json":{},#todo 后续完善
+            "knowledge_intents_json":knowledge_intents_json,
             "flows_json":flows_json
         })
 

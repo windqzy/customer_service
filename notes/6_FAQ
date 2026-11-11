@@ -1,2 +1,238 @@
 Frequently Asked Questions
 经常被询问的问题
+
+一、为什么每段代码都能看懂，调试起来却忘了前后关系？
+
+阅读一段代码，只需要知道这几行做什么。
+调试完整项目，还需要知道：谁把什么数据交给了它，它改了什么，返回给谁。
+不必同时记住所有类。先固定一个场景：电商客服办事大厅。
+
+这份笔记对应 2026-11-10 的工作区，包含对象消息补槽和自动 Action 注册。
+示例订单号 1001、物流公司和物流状态用于讲解，不代表真实接口中存在这些数据。
+
+二、先记住桌上的三样东西
+
+1. 办事手册：FlowCatalog → Flow → FlowStep。
+   来源：flow_config/user_flows.yml，由 FlowLoader 加载成 Python 对象。
+   内容：物流查询有哪些步骤，每一步需要什么，下一步去哪里。
+   它描述规则，不记录某个用户的订单号。
+
+2. 用户档案：DialogueState。
+   内容：这位用户说过什么、当前关注哪个对象、正在办什么、办到哪里。
+   来源：Repository 从数据库 JSON 恢复，找不到记录时新建。
+
+3. 本轮指令：TurnPlan / Command。
+   内容：这轮建议启动任务、填写字段、恢复任务，还是取消任务。
+   文本消息的计划由 Planner 生成；匹配的对象消息由程序直接生成补槽命令。
+
+记忆句：手册规定怎么办，档案记录办到哪，命令说明这轮改什么。
+
+三、档案内部的“套娃”
+
+DialogueState：这一位用户的档案
+├─ sender_id：档案归谁
+├─ shared：聊天共享信息
+│  ├─ focused_object：用户当前指着哪张订单/商品卡片
+│  └─ sessions：聊天会话列表
+│     └─ turns：每轮用户消息与机器人回复
+└─ tasks：任务管理区
+   ├─ active：当前正在办理的 TaskInstance，可能为 None
+   │  ├─ task_id：这一次办理的编号
+   │  ├─ flow_id：按哪份业务手册办
+   │  ├─ step_id：当前停在哪一步
+   │  └─ slots：这次办理已经填好的数据
+   └─ paused：暂停的 TaskInstance 列表
+
+看到 state.tasks.active.slots.update(...) 时，逐层念：
+“这个用户 → 任务区 → 当前任务 → 填空表 → 合并新数据”。
+
+focused_object 和 slots 不是一个字典，也不会自动同步。
+前者表示“在说哪个对象”，后者表示“当前任务使用哪些参数”。
+
+四、大厅里每个人只记一个主要职责
+
+chat_router：接待窗口。把 HTTP 请求转为 UserMessage，结果转回 API 响应。
+DialogueService：本次办理负责人。取档案 → 交给 Engine → 保存档案。
+Repository：档案管理员。负责状态 JSON 与业务对象之间的读写转换。
+DialogueEngine：调度员。准备会话、区分文本与卡片、安排处理并记录本轮对话。
+TurnPlanner：意图分析员。根据文本、历史、状态和流程目录生成本轮计划。
+TurnPlanValidator：审核员。检查计划，返回是否有效及失败原因。
+ClarifyResponse：询问员。根据澄清原因组织问题，再让模型自然化表达。
+ChitChat：闲聊接待。结合历史与当前消息生成闲聊回复。
+TaskHandler：业务小组长。按顺序调用命令处理、生命周期提示、流程执行。
+CommandProcessor：改表员。执行命令，创建/切换任务或填写 slots。
+TaskLifecycleResponder：播报员。把任务开始、恢复、切换、取消事件变成提示。
+FlowExecutor：流程执行员。对照手册和当前进度执行步骤。
+ActionRegistry：能力名册。保存 Action 名称到实例的映射。
+ActionRunner：派工员。按名称从名册找 Action，再调用 run(state)。
+具体 Action：业务接口办事员。调用商城接口，转换返回字段。
+ResponseRender：话术填写员。把 slots 填入步骤模板，生成 BotMessage。
+
+不要把角色名称当作硬性隔离保证，要看实际方法读写哪些字段。
+例如 Executor 除了推进 step_id，还会合并 Action 结果、处理 collect，
+并在 end 时清空 active。
+
+五、第一轮：用户说“我要查物流”
+
+下面假设 Planner 识别正确，且用户还没有活动任务。
+
+1. Router 把请求变成 UserMessage(type=TEXT, text="我要查物流")。
+2. Service 通过 sender_id 加载 DialogueState。
+3. Engine 准备 Session，然后走文本分支。
+4. Loader 加载 FlowCatalog，Planner 生成：
+     TurnPlan(task=TaskTurnPlan(commands=[StartFlowCommand(...)]))
+   此刻只是产生计划，还没有因为这行计划就自动创建任务。
+5. Validator 检查计划；失败就返回澄清，不继续执行任务。
+6. TaskHandler 交给 CommandProcessor 执行 start_flow。
+   这时才创建 TaskInstance：
+     flow_id = logistics_tracking
+     step_id = start
+     slots = {}
+7. 创建任务产生 TaskStarted，生命周期提示组件生成“开始物流查询”。
+8. Executor 读取 start，推进到 ask_order_number。
+9. 当前步骤是 collect，slot_name=order_number，而 slots 没有值。
+   Renderer 读取 YAML 中的模板，生成“请告诉我你的订单号。”
+10. collect 返回消息，Executor 本次调用结束，step_id 保持 ask_order_number。
+11. Handler 合并两处产生的回复；Engine 把输入和回复追加为一个 Turn。
+12. Service 保存更新后的 state；Router 返回响应。
+
+这一轮结束时，要能在脑中写出：
+  active.flow_id = logistics_tracking
+  active.step_id = ask_order_number
+  active.slots = {}
+
+“等待下一轮”是保存当前位置并结束请求，不是 Python 函数一直停着等用户。
+
+六、第二轮：用户发来订单 1001 的卡片
+
+1. Router 生成 UserMessage(type=OBJECT, object=订单卡片)。
+2. Service 重新从数据库恢复 state，里面仍是上一轮的任务进度。
+3. Engine 先将卡片保存到 shared.focused_object。
+4. is_can_fill_slots 检查：
+   有 active 吗？当前 step 是 CollectSlotStep 吗？
+   需要 order_number，收到的类型是不是 order？
+5. 匹配成功，由程序生成：
+     SetSlotsCommand(command="set_slots", slots={"order_number": "1001"})
+   不调用文本 Planner，也不需要新建 TurnPlan 或启动一个新任务。
+6. Handler 调用 CommandProcessor，将 order_number 写进当前任务的 slots。
+   SetSlots 当前不产生任务生命周期事件，所以没有新的“开始任务”提示。
+7. Executor 再次从 ask_order_number 开始，发现值已齐，推进到 lookup_logistics。
+8. action 步骤给出 action_lookup_logistics，Runner 从 Registry 找到实例。
+9. LogisticsTrackingAction 读取 slots 中的订单号，请求商城物流接口。
+10. 假设查询成功，Action 返回：
+      ActionResult(slots_update={
+          "logistics_company": "顺丰",
+          "tracking_number": "示例单号",
+          "logistics_status": "运输中"
+      })
+    此刻这是返回值，还要由 Executor 将它合并到 active.slots。
+11. response 步骤拿更新后的 slots 渲染物流结果。
+12. end 步骤把 active 置为 None，返回已经收集好的回复列表。
+13. Engine 记录本轮对话；Service 保存；Router 返回。
+
+观察快照：
+  收到卡片后：focused_object.id=1001，slots 还没因保存卡片而自动改变。
+  执行命令后：slots={order_number:1001}。
+  合并查询结果后：slots 同时包含订单号、物流公司、运单号和状态。
+  走到 end 后：active=None；聊天历史仍保存着本轮输入和回复。
+
+七、如果卡片无法补槽，走到哪里？
+
+没有活动任务、当前不是 collect、或者对象类型与槽位不匹配：
+  保留 focused_object
+    → ClarifyResponse(reason=OBJECT_REQUIRES_INTENT)
+    → 询问“你要查物流、查订单状态，还是退款？”
+    → 记录本轮对话、保存状态、结束请求。
+
+下一轮用户说“查物流”时走文本分支，Planner 能收到已保存的聚焦对象。
+能看到上下文不等于模型输出必然正确，调试时仍应检查最终 TurnPlan。
+
+八、自动注册和业务执行不要混成一条时间线
+
+组装阶段：
+  Depends 解析 get_action_registry
+    → 创建 Registry
+    → auto_action_register 扫描 custom 包
+    → 找到符合筛选条件的 Action 类，创建实例、登记名称
+    → Registry 传给 Runner，Runner 传给 Executor。
+
+执行阶段：
+  流程走到 action 步骤
+    → Runner 按名称查找已注册实例
+    → await action.run(state)
+    → 这时才请求商城接口。
+
+注册是把办事员写入名册，不是立即让他去查订单。
+Depends 负责按声明调用工厂；__init__ 接收并保存工厂传入的普通对象。
+当前没有把 Registry 配成进程单例，不能记成“程序启动时永远只扫描一次”。
+
+九、调试时先看六个位置，不要同时展开所有变量
+
+观察点                     问自己什么
+user_message               这轮输入是文字还是卡片？实际内容是什么？
+state.tasks.active          进入这轮之前，正在办什么？是否为 None？
+active.step_id / slots      当前在等什么？已经有哪些参数？
+turn_plan 或 commands      本轮决定执行什么命令？由模型还是程序产生？
+action_result              接口返回了什么？是否已合并到 slots？
+messages                   最后准备回复哪几句话？是列表还是 None？
+
+建议断点顺序：
+  Service.load 后：确认旧状态。
+  Planner 返回后，或对象分支生成 command 后：确认本轮指令。
+  CommandProcessor.run 后：确认任务和槽位变化。
+  Executor 每次获取 step 后：确认当前步骤和跳转。
+  Action 请求返回后：看 HTTP 状态、响应结构及 data 类型。
+  Engine 返回前：确认消息和本轮记录。
+
+Step Into：只有想检查下游怎么实现时才进入。
+Step Over：先确认这次调用的返回值及 state 变化。
+Step Out：已理解当前函数后返回调用者，接着看它如何使用结果。
+遇到异常，看最靠近回溯底部的自己项目代码，再沿调用者向上追。
+
+state 在本轮通常是同一个可变对象，多个组件拿到它的引用。
+因此 CommandProcessor 改 slots 后，Executor 可以读到变化，
+不必每个方法都 return state；但持久化仍需 Service 调用 Repository。
+下一轮 load 恢复的是新对象，接续的是保存的数据，不是原来的 Python 内存地址。
+
+十、看见一个名字时，把它翻译成一句话
+
+TurnPlan：本轮理解与计划，不等于已执行结果。
+Command：要改变什么，例如 set_slots。
+TaskEvent：刚刚发生了什么，例如 TaskStarted。
+FlowSlot：这个字段的定义，不是用户填的值。
+TaskInstance.slots：当前任务实际保存的值。
+ActionResult.slots_update：本次业务调用返回的待合并数据。
+BotMessage：准备回复给用户的一条消息。
+ProcessResult：本轮响应包装，包含 sender_id、message_id、messages。
+DialogueState：需要保存下来供下一轮继续用的用户状态。
+
+三个容易混淆的名字：
+  StartFlowCommand：启动一项业务的命令。
+  StartFlowStep：该流程内部的起点步骤。
+  ActionFlowStep：该流程内部调用业务能力的步骤。
+
+十一、旧比喻需要修正的地方
+
+1. FlowCatalog 是规则目录，但当前每轮会加载，并非全局唯一且不可变。
+2. Executor 不只修改 step_id，也会写入查询结果、处理槽位并结束 active。
+3. 历史实际位于 shared.sessions[].turns[]，没有独立的 History 字段。
+4. TaskLifecycleResponder 负责生命周期提示，ResponseRender 负责步骤模板；
+   ChitChat 和 ClarifyResponse 则使用各自提示词调用模型。
+5. 查询物流的 Action 调的是商城 HTTP 接口，不是本项目的状态数据库。
+
+十二、用最近的报错练习定位
+
+看到 LogisticsTrackingAction 中 data.get(...) 报字符串没有 get：
+  已进入 Action，说明这次已经走过对象匹配、补槽命令和流程推进。
+  当前要检查的是接口响应及 data 的类型，不能因此认定模型没识别成功。
+  缺少 data 字段时，当前默认值是一段文字，随后当字典读取就会报错。
+  订单不存在的失败处理尚未完善，不能用正常订单测试通过代替这个分支。
+
+最后给自己做三个预测练习，再用断点检查：
+  用户只说“查物流”，这一轮结束时 step_id 应停在哪里？
+  用户发来匹配的订单卡片，哪行代码才真正改变 active.slots？
+  任务完成后 active 为什么是 None，回复为什么仍然可以返回？
+
+参考答案：
+  ask_order_number；CommandProcessor 的 slots.update(command.slots)；
+  end 清空当前任务，但生成的 BotMessage 列表已经保存在局部变量中并逐层返回。
