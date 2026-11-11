@@ -53,7 +53,8 @@ class FlowExecutor:
             if isinstance(step, CollectSlotStep):
                 # 调用方法，从active或者对象消息获取槽位数据
                 # 返回bool，如果可以获取到槽位数据返回True，如果获取不到返回False
-                has_slots: bool = await self._run_collect_slots(step, state, bot_messages)
+                has_slots: bool = await self._run_collect_slots(
+                    step=step, state=state, bot_messages=bot_messages)
                 if has_slots:  # True
                     self._run_next_step(step, state)
                     continue
@@ -121,7 +122,7 @@ class FlowExecutor:
 
         # 2.如果获取不到，就去对象消息中获取，从对象消息中获取槽位数据更新state里面
         if not slot_value:
-            self._get_slot_data_from_object_message(step, state)
+            self._get_slot_data_from_object_message(step=step, state=state)
         # 3.如果获取不到，则返回false，设置提示信息
         slot_value = state.tasks.active.slots.get(step.slot_name)
         if not slot_value:
@@ -154,7 +155,7 @@ class FlowExecutor:
                 return link.target
 
     # 从对象消息中获取槽位数据，获取到了更新到state中
-    def _get_slot_data_from_object_message(self, step, state):
+    def _get_slot_data_from_object_message(self, step: CollectSlotStep, state: DialogueState) -> None:
         # 从state里面FocusedObject获取对象类型消息
         if not state.shared.focused_object:
             return
@@ -163,9 +164,11 @@ class FlowExecutor:
         if step.slot_name == 'order_number' and state.shared.focused_object.type == 'order':
             # 设置到state里面去  state.shared.focused_object.id 这个就是对应的订单号
             state.tasks.active.slots.update({step.slot_name: state.shared.focused_object.id})
+            return
         # 此时的id对应商品id
         if step.slot_name == 'product_id' and state.shared.focused_object.type == 'product':
             state.tasks.active.slots.update({step.slot_name: state.shared.focused_object.id})
+            return
 
 
 """
